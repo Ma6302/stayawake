@@ -9,11 +9,11 @@
 Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在下载」「Agent 在跑任务」，
 于是这些场景下机器照样熄屏休眠。stayawake 补上这一层判断。
 
-- 单个原生 exe，**380 KB**，无运行时依赖
-- 实测常驻开销：**私有内存 1.6 MB，CPU 0.12–0.18%/单核**（20 核机器上约占总算力 0.008%）
+- 单个原生 exe，**382 KB**，无运行时依赖
+- 实测常驻开销：**私有内存 2.4 MB，CPU 0.14%/单核**（20 核机器上约占总算力 0.007%）
 - 检测延迟 **2 秒**（廉价探测走快速通道，完整检测仍是 15 秒一轮）
 - 对游戏无影响：EcoQoS 丢到 E-core、BelowNormal 优先级、**绝不调 `timeBeginPeriod`**
-- 70 个单元测试
+- 106 个单元测试
 
 ---
 
@@ -21,7 +21,7 @@ Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在
 
 ```powershell
 cargo build --release
-cargo test --release          # 70 个单元测试
+cargo test --release          # 106 个单元测试
 
 # 看一眼各检测器读数（不常驻，调阈值用）
 .\target\release\stayawake.exe --status
@@ -43,9 +43,9 @@ cargo test --release          # 70 个单元测试
 src/main.rs        入口、单实例、EcoQoS、worker 循环（含快速通道）、--status
 src/engine.rs      决策核心：聚合检测 → 迟滞 → 供电策略 → execution state
 src/power.rs       SetThreadExecutionState / AC-DC / 主动睡眠 / 本地时间
-src/config.rs      配置解析、旧版自动补齐新键、原子回写（保留注释）
-src/log.rs         状态跃变日志，1 MB 轮转
-src/tray.rs        托盘图标（GDI 运行时绘制）、菜单、显示器状态通知
+src/config.rs      配置解析（非法值留痕）、旧版自动补齐新键、原子回写（保留注释）
+src/log.rs         状态跃变日志，1 MB 轮转，跨进程串行化
+src/tray.rs        托盘图标（自己光栅化，预乘 alpha）、菜单、显示器状态通知
 src/autostart.rs   登录触发的计划任务 XML，失败回退注册表 Run
 src/detect/mod.rs  Detector trait、ProcessTable 快照、CpuTracker、RateMeter
 src/detect/{audio,net,proc,dl,hint}.rs   五个检测器
@@ -189,7 +189,14 @@ policy_dc = display    # 电池: 保持屏幕
 | 蓝 + 绿点 | 强制常亮（含倒计时） |
 | 红 + 斜杠 | 已暂停 |
 
+图标是运行时算出来的（不带 `.ico` 资源），32×32 交给 shell 降采样。
+**光栅化是自己做的，不用 GDI 画** —— 原因见下面第 5 个坑，那是个会让图标彻底看不见的陷阱。
+
 菜单里每个检测器都能独立开关，改动立即生效并回写配置（保留注释）。
+回写以**磁盘当前内容**为基准，所以菜单开着的时候用记事本改配置也不会被冲掉。
+
+"强制常亮"的倒计时走完即自动回到自动模式，worker 会在截止时刻醒过来释放
+（不会多等一个 `poll_interval`）。
 
 也可以从脚本控制（`WM_COMMAND` + 菜单项 ID，见 `src/tray.rs` 顶部常量）：
 
@@ -205,17 +212,20 @@ $h = [T.W]::FindWindowW("stayawake_msgwnd","stayawake")
 
 ## 已验证
 
-**70 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
+**106 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
 
 | 模块 | 测试重点 |
 |---|---|
-| `config` | 重复键取第一个（与回写位置一致）、行尾注释保留、阈值下界夹取、`migrate` 幂等 |
+| `config` | 重复键取第一个（与回写位置一致）、行尾注释保留、阈值下界夹取、`migrate` 幂等、**非法值必须留痕**、**回写以磁盘为基准** |
 | `detect::mod` | `RateMeter` 窗口语义与最小窗口门限、`CpuTracker` PID 复用与背靠背采样 |
 | `detect::dl` | 判据真值表（心跳量级 vs 真实下载）、I/O 不可读时的退化路径 |
 | `detect::hint` | TTL 边界、**未来 mtime 判为过期** |
 | `detect::net` | probe/tick 基线独立、禁用时清基线、网卡过滤层去重 |
-| `engine` | 供电策略真值表、`Held` flags 必带 `ES_CONTINUOUS` |
+| `engine` | 供电策略真值表、`Held` flags 必带 `ES_CONTINUOUS`、**过期 Force 折叠为 Auto** |
+| `log` | 轮转边界、**并发写行行完整**（100 行零丢失、无半行） |
+| `main` | Force 截止时刻夹取休眠时长（向上取整、过期不忙等） |
 | `power` | `apply_hold` 返回值语义（首次调用即成功） |
+| `tray` | **画出的像素 alpha 必须非零**（否则托盘全透明）、预乘不变量、圆的几何、绿点在右上（钉住行序约定）、`CreateIconIndirect` 往返后 alpha 仍在 |
 | `autostart` | 计划任务 XML 的三个坑全部关闭、路径转义、UTF-16 BOM |
 
 真机验证（提权 `powercfg /requests` 是唯一真值来源）：
@@ -232,8 +242,9 @@ SYSTEM:
 - 下载器：代理软件空闲（5 条 established，心跳 0.09 KB/s）→ 正确判为不忙
 - hint：新鲜文件命中；mtime 改到 5 分钟前 → `STALE`；改到 8 小时后 → `FUTURE` 且不命中
 - 检测延迟：**2 秒**（4 次测量 2.1 / 2.0 / 1.8 / 2.0）
-- 开销：CPU 0.12–0.18% 单核，私有内存 1.6 MB
-- 压测：100 次图标重绘 + 200 次开关 toggle → GDI / USER / 句柄计数**零增长**
+- 开销：CPU 0.14% 单核（45 秒窗口），私有内存 2.4 MB
+- 压测：200 次状态切换（共 200 次图标重绘）→ `GetGuiResources` 的 GDI / USER 计数与句柄数**零增长**（4 / 5 / 208 前后一致）
+- 配置告警：故意写坏四个键（`abc` / `enabled` / `0` / `NaN`）→ `--status` 与日志各报四条，重复重载不刷屏
 - 自启：计划任务 XML 三个默认坑已确认关闭；开关点击 **8 ms 返回**（异步化前会阻塞数百 ms）
 - 单实例、配置热重载、托盘开关回写、Explorer 重启后重加图标
 
@@ -290,12 +301,10 @@ COM 回调接口（当前依赖之外），回调在 MTA 线程池上执行要�
 
 **4. 未做的健壮性改进**
 
-- `log.rs` 的轮转只有进程内互斥，第二个实例并发写会失败并被 `let _ =` 吞掉
-- `set_and_save` 基于一个更早读入的 `Config` 快照，中途的外部修改会被覆盖
-- `Snapshot::describe()` 在 `Force` 刚过期那一轮会显示「剩余 0 分 0 秒」（≤1 个周期的显示滞后）
-- 配置项的非法值静默回落到默认值，不记日志
+- `Snapshot::describe()` 里"宽限期"这一条不区分「刚停止活动」与「就要释放」，
+  只看 `reasons.is_empty()`；想显示剩余宽限秒数需要把 `last_active` 也放进快照
 
-### 本机（Win11 Insider 26340）踩到的三个坑
+### 本机（Win11 Insider 26340）踩到的五个坑
 
 1. **`RegisterPowerSettingNotification` 的 flags 必须是 `DEVICE_NOTIFY_WINDOW_HANDLE`（= 0）**。
    误传 2（`DEVICE_NOTIFY_CALLBACK`）会让系统把 HWND 当函数指针调用，直接 `0xC0000005`。
@@ -307,9 +316,36 @@ COM 回调接口（当前依赖之外），回调在 MTA 线程池上执行要�
    开机时长不足该值时直接下溢（实测开机 1.25 小时时进程静默崩溃，`0xC0000409`）。
    哨兵值要用 `Option<Instant>`，不要用"很久以前"。
 
-### 设计上必须记住的三条
+4. **进程的 MTA 只由显式 `CoInitializeEx` 的线程计引用**。不调 `CoInitializeEx`
+   直接 `CoCreateInstance` 是合法的「隐式 MTA」，但**不计引用**。所以最后一个显式
+   引用者一放弃（`CoUninitialize` **或线程直接退出**），MTA 就被拆掉，隐式线程手里
+   的 COM 对象立刻悬垂 —— 下次使用即 `0xC0000005`。
 
-这三点是审计时发现的真实缺陷，改法都不显然：
+   这在 `cargo test` 里必然出事：libtest 一个测试一个线程、结束即退出，摸 WASAPI 的
+   测试彼此是隐式/显式混合，谁先结束取决于调度。表现是**约一半概率崩溃、且每次崩在
+   不同测试上**（已用独立复现程序确认因果，非猜测）。做法是起一个永不退出的守卫线程
+   持有 MTA 引用（`detect::com_test_guard`），所有摸 COM 的测试先调它。
+
+5. **GDI 的绘制函数只写 RGB，不碰 32bpp DIB 的 alpha 字节**。`Ellipse` / `LineTo`
+   画完之后，被画到的像素 RGB 是对的而 alpha 仍是清屏时的 0 —— 整张图对 alpha
+   混合器就是「完全透明」，托盘图标是**一片空白**。
+
+   实测（独立诊断程序，逐字复制原来的绘制步骤）：`Ellipse` + `LineTo` 之后
+   **290 个像素 RGB 非零，而 alpha 非零的像素是 0 个**；走完 `CreateIconIndirect`
+   再 `GetDIBits` 回读，alpha 依然全零。
+
+   这个 bug 特别难认，因为它**不是稳定的空白**：Windows 有个「alpha 全零就当没有
+   alpha 通道、退回用 AND 掩码」的兜底，但各渲染路径并不一致 —— 所以症状是
+   「图标空白，但弹个对话框之后能看见一会儿，过一阵又没了」。而 tooltip 全程正常
+   （走 `szTip`，与图标无关），看起来像图标丢了而不是画错了。
+
+   修法不是给 GDI 补 alpha，而是**不用 GDI 画**：直接把圆和斜杠光栅化进 DIB 内存，
+   顺手做 4×4 超采样抗锯齿，alpha 用覆盖率并按**预乘**写入。少了画刷/画笔/DC 三类
+   GDI 对象，失败分支也一起消失了。
+
+### 设计上必须记住的五条
+
+这些是审计时发现的真实缺陷，改法都不显然：
 
 - **廉价探测（probe）与完整检测（tick）不能共用速率计**。probe 会推进基线，
   使紧随其后的 tick 只剩十几毫秒窗口，被 `RateMeter` 的最小窗口门限丢弃 ——
@@ -319,6 +355,12 @@ COM 回调接口（当前依赖之外），回调在 MTA 线程池上执行要�
   算出几百 % 的假 CPU。同理需要最小采样窗口（背靠背 tick 是可达状态）。
 - **文件 mtime 落在未来必须视为过期**，不能视为"刚刷新"。时钟回跳
   （CMOS 电池、双系统写 RTC、快照恢复）会让所有 hint 永久新鲜，机器再也不睡。
+- **配置回写必须以磁盘当前内容为基准**，不能拿内存里的 `Config` 快照。托盘每次
+  开菜单都会重新 `load_or_create`，但用户在菜单打开期间用记事本改了配置的话，
+  拿旧 raw 回写会把改动整份冲掉。
+- **图标的 alpha 必须自己写，且要预乘**。`paint_icon` 产出的是自上而下的缓冲，
+  而正 `biHeight` 的 DIB 是自下而上 —— 拷进去时要逐行翻转，否则绿点跑到右下、
+  暂停的斜杠从 `/` 变成 `\`。这两点都由单测钉住（`tray::tests`）。
 
 ---
 
@@ -358,6 +400,10 @@ hint_ttl_secs = 60
 
 升级版本后旧配置缺失的新键会被**自动追加**（带注释），已有值不动。
 
+写错的值不会静默吞掉：无法解析（`poll_interval_secs = abc`）或越界被夹取
+（`net_threshold_kbps = 0` → 1）都会在日志和 `--status` 的 `[配置告警]` 段列出来，
+并说明实际采用了什么值。同一条只报一次，连点托盘开关不会刷屏。
+
 `audio_ignore` 用来排除常驻输出音频的程序 —— Wallpaper Engine 已预置。
 遇到别的"永不休眠"元凶，用 `--status` 看 `[audio]` 段哪个进程 `active=true peak>0`，填进去即可。
 
@@ -367,7 +413,7 @@ hint_ttl_secs = 60
 
 ```powershell
 cargo build --release   # 产物: target\release\stayawake.exe
-cargo test --release    # 70 个单元测试
+cargo test --release    # 106 个单元测试
 cargo clippy --release --all-targets
 ```
 
@@ -375,10 +421,13 @@ cargo clippy --release --all-targets
 `windows` crate 钉在 0.52 —— 该版本的模块布局与 feature 名与新版有差异，
 升级前先用 [feature 搜索页](https://microsoft.github.io/windows-rs/features/) 逐个核对。
 
-**注意有副作用的测试**：`power::tests::apply_hold_*` 会真的调用
+**注意有副作用的测试**：`power::tests::apply_hold_*` 与 `engine::tests::step_*` 会真的调用
 `SetThreadExecutionState`（线程级，测试进程退出即释放），
 `autostart::tests::is_installed_*` 会真的跑 `schtasks` / `reg` 查询。
 都是只读或自我恢复的，但如果不想让它们跑，标 `#[ignore]`。
+
+**摸 COM 的测试必须先调 `detect::com_test_guard()`**，原因见上面第 4 个坑。
+少调一处就会带回那个间歇性 `0xC0000005`，而且崩的位置每次都不一样。
 
 ---
 
