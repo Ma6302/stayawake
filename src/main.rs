@@ -16,11 +16,11 @@ use engine::{Engine, Mode, Snapshot};
 use power::{Held, PowerSource};
 use windows::core::w;
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WPARAM,
+    ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, CreateWaitableTimerExW, GetCurrentProcess, ResetEvent,
+    CancelWaitableTimer, CreateEventW, CreateMutexW, CreateWaitableTimerExW, GetCurrentProcess,
     SetPriorityClass, SetProcessInformation, SetWaitableTimer, WaitForMultipleObjects,
     BELOW_NORMAL_PRIORITY_CLASS, CREATE_WAITABLE_TIMER_MANUAL_RESET, PROCESS_POWER_THROTTLING_STATE,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, ProcessPowerThrottling, SYNCHRONIZATION_SYNCHRONIZE,
@@ -171,6 +171,9 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
         )
     }
     .expect("CreateWaitableTimerExW");
+    // 上一次等待是被 UI kick 唤醒的吗? kick 意味着模式切换/电源事件, 必须重算快照 ——
+    // 否则快速通道会把这次唤醒直接吞掉, tooltip 与详情最长陈旧一个 poll_interval。
+    let mut kicked = false;
 
     loop {
         if shared.reload.swap(false, Ordering::SeqCst) {
@@ -192,22 +195,32 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
             .map(|t| t.elapsed() >= Duration::from_secs(cfg.poll_interval_secs))
             .unwrap_or(true);
 
-        if watching(&cfg, &engine, &shared) && !full_due && !engine.probe(&cfg) {
-            // 没有活动迹象, 继续快速探测
-            wait_next(timer, shared.kick, cfg.fast_poll_secs);
+        if watching(&cfg, &engine, &shared) && !full_due && !kicked && !engine.probe(&cfg) {
+            kicked = wait_next(timer, shared.kick, cfg.fast_poll_secs);
             continue;
         }
+        // 落到完整检测: kick 标记已消费(下面必然会重算并发布快照)。
+        // 写在这里而不是循环末尾, 是因为末尾的赋值来自新一次 wait_next。
+        kicked = false;
+        let _ = kicked;
 
-        let mode = *shared.mode.lock().unwrap();
+        let mode = *lock(&shared.mode);
         let display_on = shared.display_on.load(Ordering::SeqCst);
         let prev_held = engine.held();
+        let prev_in_grace = engine.in_grace();
         let (snap, changed) = engine.step(&cfg, mode, display_on);
         last_full = Some(Instant::now());
 
-        // Force 到点自动回 Auto
+        // Force 到点自动回 Auto。
+        // 必须在同一个锁作用域内做 compare-and-set: mode 是 ~11ms 前读的,
+        // 期间用户可能点了"强制常亮 1 小时"或"暂停", 无条件写回会把它覆盖掉
+        // (表现为"点了没反应")。只有当锁里的值仍是我们看到的那个 Force 才归零。
         if let Mode::Force(until) = mode {
             if Instant::now() >= until {
-                *shared.mode.lock().unwrap() = Mode::Auto;
+                let mut cur = lock(&shared.mode);
+                if *cur == Mode::Force(until) {
+                    *cur = Mode::Auto;
+                }
             }
         }
 
@@ -224,14 +237,29 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
                 if snap.display_on { "on" } else { "off" },
                 what
             ));
-            // 可选: 宽限期结束后主动让机器睡(默认关闭)
-            if cfg.sleep_on_release && prev_held != Held::None && snap.held == Held::None {
+            // 可选: 宽限期自然结束后主动让机器睡(默认关闭)。
+            //
+            // 只在"活动真的停了、宽限期也走完了"时触发。不能只看
+            // prev_held != None && held == None —— 那样点"暂停(允许正常休眠)"
+            // 会立刻强制睡眠, 与标签语义相反; 关掉某个检测器、AC->DC 策略变化
+            // 导致的释放也会误触发。
+            let natural_release = matches!(mode, Mode::Auto)
+                && prev_in_grace
+                && !snap.in_grace
+                && snap.reasons.is_empty();
+            if cfg.sleep_on_release
+                && natural_release
+                && prev_held != Held::None
+                && snap.held == Held::None
+            {
                 log::event("sleep_on_release -> SetSuspendState");
-                power::suspend_now();
+                if !power::suspend_now() {
+                    log::event("warn: SetSuspendState failed (需要 SE_SHUTDOWN_NAME 权限?)");
+                }
             }
         }
 
-        *shared.snapshot.lock().unwrap() = Some(snap);
+        *lock(&shared.snapshot) = Some(snap);
         if let Some(h) = hwnd {
             unsafe {
                 let _ = PostMessageW(h, WM_STATE_CHANGED, WPARAM(0), LPARAM(0));
@@ -248,7 +276,7 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
         } else {
             cfg.poll_interval_secs
         };
-        wait_next(timer, shared.kick, next);
+        kicked = wait_next(timer, shared.kick, next);
     }
 }
 
@@ -258,19 +286,41 @@ fn watching(cfg: &config::Config, engine: &Engine, shared: &Arc<Shared>) -> bool
     cfg.fast_poll_secs > 0
         && cfg.fast_poll_secs < cfg.poll_interval_secs
         && engine.held() == Held::None
-        && matches!(*shared.mode.lock().unwrap(), Mode::Auto)
+        && matches!(*lock(&shared.mode), Mode::Auto)
 }
 
 /// 等到定时器到期或被 UI 线程踢醒。定时器用一次性模式, 每次调用重新武装。
-fn wait_next(timer: HANDLE, kick: HANDLE, secs: u64) {
+/// 返回 true 表示是被 kick 唤醒的(而非定时器到期)。
+fn wait_next(timer: HANDLE, kick: HANDLE, secs: u64) -> bool {
     let due = -(secs as i64) * 10_000_000;
     unsafe {
-        let _ = SetWaitableTimer(timer, &due, 0, None, None, false);
-        let r = WaitForMultipleObjects(&[timer, kick], false, u32::MAX);
-        if r == WAIT_OBJECT_0 {
-            let _ = ResetEvent(timer);
+        if SetWaitableTimer(timer, &due, 0, None, None, false).is_err() {
+            // 定时器武装失败会让下面的 INFINITE 等待永久阻塞(只剩 UI kick 能唤醒),
+            // 轮询就静默停止了。退化为忙等 sleep, 保证循环继续。
+            log::event("warn: SetWaitableTimer 失败, 退化为 sleep");
+            std::thread::sleep(Duration::from_secs(secs));
+            return false;
         }
+        let r = WaitForMultipleObjects(&[timer, kick], false, u32::MAX);
+        if r == WAIT_FAILED {
+            // 句柄失效等极端情况: 不能直接 continue, 否则 worker 100% 占用一核
+            log::event("warn: WaitForMultipleObjects 失败");
+            std::thread::sleep(Duration::from_secs(secs.min(5)));
+            return false;
+        }
+        if r == WAIT_OBJECT_0 {
+            let _ = CancelWaitableTimer(timer);
+            return false; // 定时器到期
+        }
+        true // kick
     }
+}
+
+/// 毒化容错的加锁: Mode / Option<Snapshot> 都不可能因 panic 处于破损状态,
+/// 而 worker 线程一旦因毒化 panic, execution state 立刻释放且托盘会永远显示旧状态
+/// (完全静默的失败)。所以宁可继续用里面的值。
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ───────────────────────────── --status ─────────────────────────────
@@ -337,9 +387,12 @@ fn print_status() {
     ));
 
     write_console(&(out.join("\n") + "\n"));
+    // 释放刚才 step() 可能设下的 execution state
+    let _ = power::apply_hold(Held::None);
+    // engine 持有 IMMDeviceEnumerator, 必须在 CoUninitialize 之前析构 ——
+    // 否则会在已拆除的 apartment 上调 Release
+    drop(engine);
     unsafe {
-        // 释放刚才 step() 可能设下的 execution state
-        let _ = power::apply_hold(Held::None);
         CoUninitialize();
     }
 }

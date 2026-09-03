@@ -112,35 +112,53 @@ fn filetime_u64(ft: FILETIME) -> u64 {
 
 // ───────────────────────── CPU 采样 ─────────────────────────
 
+/// 单个进程的一次 CPU 采样
+#[derive(Clone, Copy)]
+struct CpuSample {
+    /// 进程创建时间, 用于防 PID 回收错认
+    create: u64,
+    /// 内核+用户态累计 CPU 秒
+    cpu: f64,
+    /// 该样本的采集时刻。**必须与样本一起存** —— 用全局时间戳会导致:
+    ///   - 检测器被关闭一段时间后重新启用时, Δcpu 跨越数小时而 wall 只有一个 tick
+    ///     -> 虚假的几百 %; 而托盘开关是文档化功能, 完全可复现
+    ///   - 某进程连续几个 tick 读不到(提权/AV 干扰)再恢复时同样过报
+    at: Instant,
+}
+
 /// 跨 tick 追踪指定 pid 的 CPU 时间, 输出"单核百分比"
 /// (Δcpu / Δwall × 100; 单线程打满一核 = 100%)
 #[derive(Default)]
 pub struct CpuTracker {
-    /// pid -> (进程创建时间, 累计 cpu 秒)  —— 创建时间用于防 PID 回收错认
-    cache: HashMap<u32, (u64, f64)>,
-    last_sample: Option<Instant>,
+    cache: HashMap<u32, CpuSample>,
 }
 
+/// 最小采样窗口(秒)。GetProcessTimes 的量化粒度是调度器 tick(~15.6ms),
+/// 窗口太短会把一个量化单位放大成几百 % (5ms 窗口 -> 312%)。
+/// 背靠背的完整 tick 是可达状态(连续两次 kick), 必须挡住。
+const MIN_CPU_WINDOW: f64 = 0.3;
+
 impl CpuTracker {
-    /// 首次见到某 pid 时返回 None(还没有差值可算)
+    /// 首次见到某 pid、窗口过短、或 PID 被回收时返回 None
     pub fn cpu_percent(&mut self, pid: u32) -> Option<f64> {
+        let (create, cpu) = read_process_times(pid)?;
         let now = Instant::now();
-        let wall = self.last_sample.map(|t| (now - t).as_secs_f64());
+        let prev = self.cache.insert(pid, CpuSample { create, cpu, at: now });
 
-        let (create, cpu_now) = read_process_times(pid)?;
-        let prev = self.cache.insert(pid, (create, cpu_now));
-
-        let (wall, (prev_create, prev_cpu)) = (wall?, prev?);
-        if prev_create != create || wall <= 0.0 {
-            return None; // PID 被回收, 或时间未推进
+        let prev = prev?;
+        if prev.create != create {
+            return None; // PID 被回收, 上一个样本属于别的进程
         }
-        Some((cpu_now - prev_cpu).max(0.0) / wall * 100.0)
+        let wall = now.duration_since(prev.at).as_secs_f64();
+        if wall < MIN_CPU_WINDOW {
+            return None;
+        }
+        Some((cpu - prev.cpu).max(0.0) / wall * 100.0)
     }
 
-    /// 每 tick 末调用: 淘汰已退出进程, 推进时间基准
+    /// 每 tick 末调用: 淘汰已退出进程
     pub fn end_tick(&mut self, table: &ProcessTable) {
         self.cache.retain(|pid, _| table.alive(*pid));
-        self.last_sample = Some(Instant::now());
     }
 }
 
@@ -172,12 +190,124 @@ pub struct RateMeter {
 
 impl RateMeter {
     pub fn update(&mut self, total: u64) -> Option<f64> {
-        let now = Instant::now();
+        self.update_at(total, Instant::now())
+    }
+
+    /// 供单测注入时刻。
+    fn update_at(&mut self, total: u64, now: Instant) -> Option<f64> {
         let rate = self.prev.and_then(|(prev_total, prev_t)| {
-            let dt = (now - prev_t).as_secs_f64();
+            let dt = now.duration_since(prev_t).as_secs_f64();
             (dt > 0.05).then(|| total.saturating_sub(prev_total) as f64 / dt)
         });
         self.prev = Some((total, now));
         rate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn rate_meter_first_call_has_no_baseline() {
+        let mut m = RateMeter::default();
+        assert_eq!(m.update_at(1000, Instant::now()), None);
+    }
+
+    #[test]
+    fn rate_meter_computes_per_second_rate() {
+        let t0 = Instant::now();
+        let mut m = RateMeter::default();
+        m.update_at(0, t0);
+        let r = m.update_at(2048, t0 + Duration::from_secs(2)).unwrap();
+        assert!((r - 1024.0).abs() < 0.001, "得到 {}", r);
+    }
+
+    /// 窗口过短要返回 None 而不是一个被放大的数字。
+    /// 这是 1.1 缺陷的根源: probe 推进基线后 tick 只剩十几毫秒。
+    #[test]
+    fn rate_meter_rejects_tiny_window() {
+        let t0 = Instant::now();
+        let mut m = RateMeter::default();
+        m.update_at(0, t0);
+        assert_eq!(m.update_at(1_000_000, t0 + Duration::from_millis(15)), None);
+    }
+
+    /// 计数器回绕/重置时不能给出负数或天文数字
+    #[test]
+    fn rate_meter_survives_counter_reset() {
+        let t0 = Instant::now();
+        let mut m = RateMeter::default();
+        m.update_at(10_000, t0);
+        let r = m.update_at(5, t0 + Duration::from_secs(1)).unwrap();
+        assert_eq!(r, 0.0);
+    }
+
+    /// 独立的两个计量器互不干扰 —— net.rs 依赖这一点(probe / tick 各一个)
+    #[test]
+    fn separate_meters_do_not_share_baseline() {
+        let t0 = Instant::now();
+        let mut probe = RateMeter::default();
+        let mut tick = RateMeter::default();
+        probe.update_at(0, t0);
+        tick.update_at(0, t0);
+
+        // probe 每 2s 采一次
+        probe.update_at(1024, t0 + Duration::from_secs(2));
+        // tick 在 probe 之后 15ms 采样, 但它有自己的基线, 窗口是完整的 2.015s
+        let r = tick
+            .update_at(1024, t0 + Duration::from_millis(2015))
+            .expect("tick 应拿到完整窗口");
+        assert!(r > 400.0 && r < 600.0, "得到 {}", r);
+    }
+
+    #[test]
+    fn cpu_tracker_first_sighting_returns_none() {
+        let mut t = CpuTracker::default();
+        let me = std::process::id();
+        assert_eq!(t.cpu_percent(me), None, "首次见到某 pid 无法算差值");
+    }
+
+    /// 最小窗口保护: 背靠背两次采样必须返回 None, 否则
+    /// GetProcessTimes 的 15.6ms 量化会被放大成几百 %
+    #[test]
+    fn cpu_tracker_rejects_back_to_back_samples() {
+        let mut t = CpuTracker::default();
+        let me = std::process::id();
+        t.cpu_percent(me);
+        assert_eq!(t.cpu_percent(me), None, "窗口远小于 MIN_CPU_WINDOW");
+    }
+
+    #[test]
+    fn cpu_tracker_reports_after_min_window() {
+        let mut t = CpuTracker::default();
+        let me = std::process::id();
+        t.cpu_percent(me);
+        // 睡过最小窗口, 期间本进程几乎不耗 CPU
+        std::thread::sleep(Duration::from_secs_f64(MIN_CPU_WINDOW + 0.1));
+        let pct = t.cpu_percent(me).expect("窗口足够, 应能算出");
+        assert!((0.0..300.0).contains(&pct), "得到 {}", pct);
+    }
+
+    #[test]
+    fn cpu_tracker_ignores_unknown_pid() {
+        let mut t = CpuTracker::default();
+        // pid 0 是 System Idle Process, OpenProcess 必失败
+        assert_eq!(t.cpu_percent(0), None);
+    }
+
+    /// PID 被回收时必须丢弃旧样本, 否则会把别的进程的 CPU 算进来
+    #[test]
+    fn cpu_tracker_detects_pid_reuse() {
+        let mut t = CpuTracker::default();
+        let me = std::process::id();
+        t.cpu_percent(me);
+        // 手动把创建时间改掉, 模拟"同一 pid 换了进程"
+        if let Some(s) = t.cache.get_mut(&me) {
+            s.create ^= 0xDEAD_BEEF;
+            s.at = Instant::now() - Duration::from_secs(10);
+        }
+        assert_eq!(t.cpu_percent(me), None, "创建时间不同应判为 PID 复用");
     }
 }

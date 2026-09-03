@@ -74,13 +74,16 @@ proc_busy_when_cpu = cargo.exe, rustc.exe, link.exe, cl.exe, msbuild.exe, node.e
 
 
 # ── 下载器 (I/O 密集但 CPU≈0, 需专用规则) ──
-# 注意: I/O 阈值只对此名单生效。Electron 类应用的进程间共享内存流量会到 GB/s 级, 全局启用必假阳性
+# 判据: io >= dl_io_kbps, 或者 (established TCP >= dl_tcp_conns 且 io > 0)
+# 注意: I/O 阈值只对此名单生效。Electron 类应用的进程间共享内存流量会到 GB/s, 全局启用必假阳性
 dl_enabled = true
-dl_processes = IDMan.exe, idmBroker.exe, aria2c.exe, qbittorrent.exe
+# 不要往这里加 BT 客户端(qBittorrent/Transmission 等): 做种时会长期持有几十条
+# established 连接而吞吐为零, 虽然有 "io>0" 约束兜着, 但 BT 的心跳流量仍可能持续触发
+dl_processes = IDMan.exe, idmBroker.exe, aria2c.exe
 # 进程 Read+Write 传输速率阈值(KB/s)
 dl_io_kbps = 50
 # established TCP 连接数阈值。IDM 默认每文件开 8 条; 空闲时 0-2 条
-# 专门抓"服务器卡住、速度接近 0 但下载仍在进行"
+# 配合 "io>0" 使用, 抓"服务器限速、速度很低但仍在传输"
 dl_tcp_conns = 4
 
 
@@ -143,9 +146,27 @@ fn parse_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// 旧版配置补齐新键: 只追加缺失项, 不动用户已有内容。
-/// 追加后立即落盘, 用户下次打开配置文件就能看到新选项和注释。
+/// 旧版配置补齐新键: 只追加缺失项(连同它上方的注释), 不动用户已有内容。
+///
+/// 追加后落盘, 这样用户打开配置文件就能看到新选项及其说明。
+/// 写入失败只记一次日志: 文件只读或磁盘满时不该每次加载都刷屏。
 fn migrate(text: &str) -> String {
+    let merged = migrate_text(text);
+    if merged.len() == text.len() {
+        return merged; // 无变化, 不写盘
+    }
+    if let Err(e) = write_atomic(&config_path(), &merged) {
+        // 只在首次失败时记录, 避免只读文件导致每次加载都写日志
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log::event(&format!("warn: 无法写入迁移后的配置: {}", e));
+        }
+    }
+    merged
+}
+
+/// migrate 的纯函数部分(不碰文件系统), 便于单测。
+fn migrate_text(text: &str) -> String {
     let existing: Vec<String> = text
         .lines()
         .filter_map(|l| {
@@ -157,17 +178,31 @@ fn migrate(text: &str) -> String {
         })
         .collect();
 
+    // 收集缺失键, 连同紧挨在它上方的注释块一起搬过来
+    let lines: Vec<&str> = DEFAULT_CONFIG.lines().collect();
     let mut added: Vec<String> = Vec::new();
-    for line in DEFAULT_CONFIG.lines() {
+    for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
         let Some(eq) = t.find('=') else { continue };
-        let key = t[..eq].trim();
-        if !existing.iter().any(|k| k == key) {
-            added.push(line.to_string());
+        if existing.iter().any(|k| k == t[..eq].trim()) {
+            continue;
         }
+        // 往上回溯连续的注释行(不跨空行), 保留原始缩进
+        let mut comments: Vec<String> = Vec::new();
+        for prev in lines[..i].iter().rev() {
+            let p = prev.trim();
+            if p.starts_with('#') && !p.starts_with("# ──") {
+                comments.push(prev.to_string());
+            } else {
+                break;
+            }
+        }
+        comments.reverse();
+        added.extend(comments);
+        added.push(line.to_string());
     }
     if added.is_empty() {
         return text.to_string();
@@ -177,8 +212,24 @@ fn migrate(text: &str) -> String {
     merged.push_str("\n\n# ── 以下为新版本追加的配置项 ──\n");
     merged.push_str(&added.join("\n"));
     merged.push('\n');
-    let _ = std::fs::write(config_path(), &merged);
     merged
+}
+
+/// 原子写: 先写临时文件再 rename。
+///
+/// 直接 `fs::write` 是"截断后写入", 另一个线程恰好在窗口内读就会看到空文件,
+/// `load_or_create` 随即走 `_ =>` 分支用 DEFAULT_CONFIG 覆盖 —— 用户配置全丢。
+/// Windows 上 rename 到已存在的目标映射为 MoveFileExW(REPLACE_EXISTING), 是原子的。
+fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("ini.tmp");
+    std::fs::write(&tmp, text)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 impl Config {
@@ -187,8 +238,16 @@ impl Config {
         let _ = std::fs::create_dir_all(app_dir());
         let text = match std::fs::read_to_string(&path) {
             Ok(t) if !t.trim().is_empty() => migrate(&t),
-            _ => {
-                let _ = std::fs::write(&path, DEFAULT_CONFIG);
+            Ok(_) => {
+                // 文件存在但是空的。可能是上一次写入被打断, 也可能用户清空了它。
+                // 不覆盖(避免和并发写入互相踩), 只用默认值跑起来。
+                DEFAULT_CONFIG.to_string()
+            }
+            Err(_) => {
+                // 真的不存在 -> 生成默认配置
+                if let Err(e) = write_atomic(&path, DEFAULT_CONFIG) {
+                    crate::log::event(&format!("warn: 无法写入配置文件: {}", e));
+                }
                 DEFAULT_CONFIG.to_string()
             }
         };
@@ -207,9 +266,11 @@ impl Config {
             if let Some(eq) = t.find('=') {
                 let key = t[..eq].trim().to_string();
                 let val = strip_comment(&t[eq + 1..]).to_string();
-                match map.iter_mut().find(|(k, _)| *k == key) {
-                    Some(slot) => slot.1 = val,
-                    None => map.push((key, val)),
+                // 重复键取**第一个**, 与 set_and_save 的写回位置保持一致。
+                // 若取最后一个, 用户配置里有重复键时托盘开关会永久静默失效:
+                // 写入改的是第一行, 生效值却来自最后一行 -> 勾选永远不变。
+                if !map.iter().any(|(k, _)| *k == key) {
+                    map.push((key, val));
                 }
             }
         }
@@ -260,7 +321,8 @@ impl Config {
             audio_ignore: parse_list(get("audio_ignore")),
 
             net_enabled: b("net_enabled", true),
-            net_threshold_kbps: u("net_threshold_kbps", 1024),
+            // 阈值为 0 会让 "kbps < 0" 永假 -> 零流量也每 tick 命中 -> 永久持有
+            net_threshold_kbps: u("net_threshold_kbps", 1024).max(1),
             net_min_consecutive_tick: u("net_min_consecutive_tick", 2).clamp(1, 100) as u32,
 
             proc_enabled: b("proc_enabled", true),
@@ -269,7 +331,8 @@ impl Config {
 
             dl_enabled: b("dl_enabled", true),
             dl_processes: parse_list(get("dl_processes")),
-            dl_io_kbps: u("dl_io_kbps", 50),
+            // 阈值不能为 0: 那会让"零流量也判定为忙"从而永久持有
+            dl_io_kbps: u("dl_io_kbps", 50).max(1),
             dl_tcp_conns: u("dl_tcp_conns", 4).clamp(1, 10000) as u32,
 
             hint_enabled: b("hint_enabled", true),
@@ -279,8 +342,11 @@ impl Config {
         }
     }
 
-    /// 托盘开关回写: 就地替换该键的值, 其他行(含注释)原样保留
-    pub fn set_and_save(&mut self, key: &str, value: &str) {
+    /// 就地替换某键的值, 返回完整的新文件内容。**不落盘**, 便于单测。
+    ///
+    /// 只改第一次出现的位置 —— 与 `from_text` 的"重复键取第一个"必须一致,
+    /// 否则用户配置里有重复键时开关会永久静默失效。
+    fn rewrite(&mut self, key: &str, value: &str) -> String {
         let mut found = false;
         for line in self.raw.iter_mut() {
             let t = line.trim();
@@ -307,8 +373,144 @@ impl Config {
         if !found {
             self.raw.push(format!("{} = {}", key, value));
         }
-        let text = self.raw.join("\n") + "\n";
-        let _ = std::fs::write(config_path(), &text);
+        self.raw.join("\n") + "\n"
+    }
+
+    /// 托盘开关回写: 就地替换该键的值, 其他行(含注释)原样保留。
+    ///
+    /// 返回是否成功落盘。失败(只读文件/磁盘满/ACL)必须让调用方知道 ——
+    /// 否则托盘上的勾看起来变了, 下次加载又变回去, 用户完全不明白发生了什么。
+    pub fn set_and_save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let text = self.rewrite(key, value);
+        let result = write_atomic(&config_path(), &text).map_err(|e| e.to_string());
+        // 无论是否落盘成功, 内存里的 self 都更新为新值:
+        // 失败时至少本次运行的行为符合用户意图
         *self = Config::from_text(&text);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 重复键必须取第一个 —— 与 rewrite 改写的位置一致。
+    /// 若取最后一个, 用户配置里有重复键时托盘开关会永久静默失效。
+    #[test]
+    fn duplicate_key_takes_first_and_rewrite_matches() {
+        let text = "audio_enabled = false\nnet_enabled = true\naudio_enabled = true\n";
+        let mut cfg = Config::from_text(text);
+        assert!(!cfg.audio_enabled, "重复键应取第一个(false)");
+
+        // 改写后必须真的生效, 否则就是"点了没反应"的静默失效
+        let out = cfg.rewrite("audio_enabled", "true");
+        assert!(Config::from_text(&out).audio_enabled);
+        assert_eq!(out.matches("audio_enabled").count(), 2, "不该新增行");
+    }
+
+    #[test]
+    fn strips_inline_comments_and_keeps_them_on_rewrite() {
+        let text = "poll_interval_secs = 30   # 我的注释\ngrace_secs = 45 ; 分号也算\n";
+        let cfg = Config::from_text(text);
+        assert_eq!(cfg.poll_interval_secs, 30);
+        assert_eq!(cfg.grace_secs, 45);
+
+        let mut cfg2 = Config::from_text(text);
+        let out = cfg2.rewrite("poll_interval_secs", "10");
+        assert!(out.contains("# 我的注释"), "行尾注释必须保留: {}", out);
+        assert_eq!(Config::from_text(&out).poll_interval_secs, 10);
+    }
+
+    #[test]
+    fn rewrite_preserves_comment_lines_and_order() {
+        let text = "# 顶部说明\naudio_enabled = true\n\n# 另一段\nnet_enabled = true\n";
+        let mut cfg = Config::from_text(text);
+        let out = cfg.rewrite("net_enabled", "false");
+        assert!(out.contains("# 顶部说明"));
+        assert!(out.contains("# 另一段"));
+        assert!(out.starts_with("# 顶部说明"));
+    }
+
+    #[test]
+    fn missing_key_is_appended() {
+        let mut cfg = Config::from_text("audio_enabled = true\n");
+        let out = cfg.rewrite("hint_enabled", "false");
+        assert!(out.contains("hint_enabled = false"));
+        assert!(!Config::from_text(&out).hint_enabled);
+    }
+
+    /// 阈值为 0 会让"零流量也判定为忙"从而永久持有, 必须被夹到 >=1
+    #[test]
+    fn zero_thresholds_are_clamped() {
+        let cfg = Config::from_text("net_threshold_kbps = 0\ndl_io_kbps = 0\n");
+        assert!(cfg.net_threshold_kbps >= 1);
+        assert!(cfg.dl_io_kbps >= 1);
+    }
+
+    #[test]
+    fn fast_poll_never_exceeds_poll_interval() {
+        let cfg = Config::from_text("poll_interval_secs = 5\nfast_poll_secs = 60\n");
+        assert!(cfg.fast_poll_secs <= cfg.poll_interval_secs);
+        // 0 表示显式关闭, 必须保留
+        assert_eq!(Config::from_text("fast_poll_secs = 0\n").fast_poll_secs, 0);
+    }
+
+    #[test]
+    fn malformed_values_fall_back_to_defaults() {
+        let cfg = Config::from_text("poll_interval_secs = abc\npolicy_ac = 乱写\n");
+        assert_eq!(cfg.poll_interval_secs, 15);
+        assert_eq!(cfg.policy_ac, "system");
+    }
+
+    #[test]
+    fn bool_accepts_common_spellings() {
+        for (s, want) in [("on", true), ("YES", true), ("1", true), ("off", false), ("no", false)] {
+            let cfg = Config::from_text(&format!("audio_enabled = {}\n", s));
+            assert_eq!(cfg.audio_enabled, want, "输入 {}", s);
+        }
+    }
+
+    #[test]
+    fn list_parsing_trims_and_drops_empties() {
+        let cfg = Config::from_text("dl_processes =  a.exe , , b.exe ,\n");
+        assert_eq!(cfg.dl_processes, vec!["a.exe", "b.exe"]);
+    }
+
+    /// 默认配置必须自洽: 每个键都能被解析出预期值
+    #[test]
+    fn default_config_parses_to_documented_values() {
+        let cfg = Config::from_text(DEFAULT_CONFIG);
+        assert_eq!(cfg.poll_interval_secs, 15);
+        assert_eq!(cfg.fast_poll_secs, 2);
+        assert_eq!(cfg.grace_secs, 90);
+        assert_eq!(cfg.policy_ac, "system");
+        assert_eq!(cfg.policy_dc, "display");
+        assert!(cfg.never_wake_display);
+        assert!(!cfg.sleep_on_release);
+        assert_eq!(cfg.net_threshold_kbps, 1024);
+        assert_eq!(cfg.audio_hold_secs, 20);
+        assert!(cfg.audio_ignore.iter().any(|s| s.eq_ignore_ascii_case("wallpaper64.exe")));
+        // BT 客户端不该在默认名单里: 做种时连接数高而吞吐为零
+        assert!(
+            !cfg.dl_processes.iter().any(|s| s.to_lowercase().contains("qbittorrent")),
+            "默认下载器名单不应含 BT 客户端"
+        );
+    }
+
+    /// migrate 只补缺失键, 不动已有值, 且要带上注释
+    #[test]
+    fn migrate_adds_missing_keys_with_comments() {
+        let old = "poll_interval_secs = 7\n";
+        let merged = migrate_text(old);
+        let cfg = Config::from_text(&merged);
+        assert_eq!(cfg.poll_interval_secs, 7, "已有值不能被覆盖");
+        assert!(merged.contains("audio_hold_secs"), "缺失键要补上");
+        assert!(merged.contains('#'), "补的键要带注释");
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        let once = migrate_text(DEFAULT_CONFIG);
+        assert_eq!(once, DEFAULT_CONFIG, "键齐全时不该改动");
     }
 }

@@ -19,6 +19,7 @@ Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在
 
 ```powershell
 cargo build --release
+cargo test --release          # 70 个单元测试
 
 # 看一眼各检测器读数（不常驻，调阈值用）
 .\target\release\stayawake.exe --status
@@ -41,7 +42,7 @@ cargo build --release
 | **音频** | WASAPI 逐会话：`state==Active` 且 20s 内响过 | 枚举全部输出端点（扬声器/蓝牙/HDMI/USB 都算）。峰值保持窗口避免乐曲安静段落造成状态抖动 |
 | **网络** | `GetIfTable2` 全网卡字节差分 ≥ 1 MB/s，连续 2 tick | 15s 窗口天然滤掉遥测突发 |
 | **进程 CPU** | 白名单进程单核占用 ≥ 5% | 只针对 cargo/rustc/ffmpeg 这类「高 CPU = 真在干活」的工具 |
-| **下载器** | 进程 I/O ≥ 50 KB/s **或** established TCP ≥ 4 | 专治 IDM（实测 CPU 恒为 0，靠 CPU 判不出来） |
+| **下载器** | 进程 I/O ≥ 50 KB/s，**或**（established TCP ≥ 4 且 I/O ≥ 5 KB/s） | 专治 IDM（实测 CPU 恒为 0，靠 CPU 判不出来） |
 | **提示文件** | `hints\*.hint` 的 mtime 在 TTL 内 | 给任何程序留的精确通道 |
 
 任一命中即视为"忙"。
@@ -51,8 +52,15 @@ cargo build --release
 实测 IDM 空闲 45 分钟累计 CPU 只有 2.55 秒，**下载时 CPU 也几乎为 0**（I/O 密集而非计算密集）。
 所以既不能靠"进程存在"（开机就永不休眠），也不能靠 CPU 阈值。
 
-TCP 连接数那条专门解决「服务器卡住、速度接近 0 但下载并未结束」：
+TCP 连接数那条针对「服务器限速、速度很低但下载并未结束」：
 IDM 默认每文件开 8 条连接，空闲时 0–2 条，阈值 4 可干净区分。
+
+但**连接数不能单独成为判据**。做种中的 BT 客户端会长期持有几十条 established 连接而吞吐为零，
+只看连接数就会让机器再也不睡（和 Wallpaper Engine 一直输出音频是同一类问题）。
+所以这条要求同时有 ≥ 5 KB/s 的吞吐。
+
+5 KB/s 这个下限是实测定的：代理软件（verge-mihomo，5 条 established）空闲时的心跳流量稳定在
+**0.09 KB/s**，用 `> 0` 会永久命中。默认名单也不含 BT 客户端。
 
 > `dl_io_kbps` 只对 `dl_processes` 名单生效，绝不能做成全局规则。
 > 实测 OpenCode 的 renderer↔gpu 共享内存流量达 **7.3 MB/s 且一字节未落盘** ——
@@ -150,7 +158,20 @@ $h = [T.W]::FindWindowW("stayawake_msgwnd","stayawake")
 
 ## 已验证
 
-用 **提权的 `powercfg /requests`** 交叉验证（这是唯一的真值来源）：
+**70 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
+
+| 模块 | 测试重点 |
+|---|---|
+| `config` | 重复键取第一个（与回写位置一致）、行尾注释保留、阈值下界夹取、`migrate` 幂等 |
+| `detect::mod` | `RateMeter` 窗口语义与最小窗口门限、`CpuTracker` PID 复用与背靠背采样 |
+| `detect::dl` | 判据真值表（心跳量级 vs 真实下载）、I/O 不可读时的退化路径 |
+| `detect::hint` | TTL 边界、**未来 mtime 判为过期** |
+| `detect::net` | probe/tick 基线独立、禁用时清基线、网卡过滤层去重 |
+| `engine` | 供电策略真值表、`Held` flags 必带 `ES_CONTINUOUS` |
+| `power` | `apply_hold` 返回值语义（首次调用即成功） |
+| `autostart` | 计划任务 XML 的三个坑全部关闭、路径转义、UTF-16 BOM |
+
+真机验证（提权 `powercfg /requests` 是唯一真值来源）：
 
 ```
 SYSTEM:
@@ -159,11 +180,14 @@ SYSTEM:
 
 其余实测项：
 
-- 音频：播放 440 Hz 测试音 → 命中 `audio: ...(0.87)`，停止后宽限期到点释放
-- 网速：与 `Get-NetAdapterStatistics` 同窗口对照，65.6 vs 74.3 KB/s（差异来自采样时点，量级一致）
-- hint：新鲜文件命中，mtime 改到 5 分钟前 → `STALE`，`desired = none`
-- 开销：10 次 30s 采样，CPU 0.14–0.18%，私有内存稳定 2.0 MB，无句柄泄漏
-- 自启：计划任务 XML 已确认 `DisallowStartIfOnBatteries=false`、`StopIfGoingOnBatteries=false`、`ExecutionTimeLimit=PT0S`
+- 音频：播放 440 Hz 测试音 → 命中 `audio: ...(0.87)`，连续播放 60 秒零抖动，停止后按宽限期释放
+- 网速：清华镜像 ISO 下载 → **6 秒内命中 `net:10.0MB/s`**，停止后释放
+- 下载器：代理软件空闲（5 条 established，心跳 0.09 KB/s）→ 正确判为不忙
+- hint：新鲜文件命中；mtime 改到 5 分钟前 → `STALE`；改到 8 小时后 → `FUTURE` 且不命中
+- 检测延迟：**2 秒**（4 次测量 2.1 / 2.0 / 1.8 / 2.0）
+- 开销：CPU 0.12–0.18% 单核，私有内存 1.6 MB
+- 压测：100 次图标重绘 + 200 次开关 toggle → GDI / USER / 句柄计数**零增长**
+- 自启：计划任务 XML 三个默认坑已确认关闭；开关点击 **8 ms 返回**（异步化前会阻塞数百 ms）
 - 单实例、配置热重载、托盘开关回写、Explorer 重启后重加图标
 
 ---
@@ -175,13 +199,30 @@ SYSTEM:
 - 网络检测是全机聚合，不区分进程；VPN / 局域网流量同样计入。
 - 一旦已进入 Modern Standby，桌面应用被 DAM 挂起，我们也跑不动 —— 所以整个设计是**提前阻止进入**。
 
-### 本机（Win11 Insider 26340）踩到的两个坑
+### 本机（Win11 Insider 26340）踩到的三个坑
 
 1. **`RegisterPowerSettingNotification` 的 flags 必须是 `DEVICE_NOTIFY_WINDOW_HANDLE`（= 0）**。
    误传 2（`DEVICE_NOTIFY_CALLBACK`）会让系统把 HWND 当函数指针调用，直接 `0xC0000005`。
 
 2. **`SetWaitableTimer` 的周期模式在本机会连续触发**，造成每秒数十次 tick 的风暴。
    改成一次性定时器 + 每轮手动重新武装后正常。
+
+3. **`Instant::now() - Duration::from_secs(86400)` 会 panic**。`Instant` 是单调时钟，
+   开机时长不足该值时直接下溢（实测开机 1.25 小时时进程静默崩溃，`0xC0000409`）。
+   哨兵值要用 `Option<Instant>`，不要用"很久以前"。
+
+### 设计上必须记住的三条
+
+这三点是审计时发现的真实缺陷，改法都不显然：
+
+- **廉价探测（probe）与完整检测（tick）不能共用速率计**。probe 会推进基线，
+  使紧随其后的 tick 只剩十几毫秒窗口，被 `RateMeter` 的最小窗口门限丢弃 ——
+  `consec` 永远无法累积，网速检测彻底失效。
+- **CPU 采样的时间戳必须与样本一起存**，不能用一个全局 `last_sample`。
+  检测器被关掉一段时间再开启时，Δcpu 会跨越数小时而分母只有一个 tick，
+  算出几百 % 的假 CPU。同理需要最小采样窗口（背靠背 tick 是可达状态）。
+- **文件 mtime 落在未来必须视为过期**，不能视为"刚刷新"。时钟回跳
+  （CMOS 电池、双系统写 RTC、快照恢复）会让所有 hint 永久新鲜，机器再也不睡。
 
 ---
 
@@ -212,10 +253,9 @@ proc_cpu_percent_1core = 5.0
 proc_busy_when_cpu     = cargo.exe, rustc.exe, ffmpeg.exe, ...
 
 dl_enabled   = true
-dl_processes = IDMan.exe, idmBroker.exe, aria2c.exe, qbittorrent.exe
+dl_processes = IDMan.exe, idmBroker.exe, aria2c.exe
 dl_io_kbps   = 50
 dl_tcp_conns = 4
-
 hint_enabled  = true
 hint_ttl_secs = 60
 ```

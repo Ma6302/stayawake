@@ -16,6 +16,8 @@ struct HintRead {
     name: String,
     note: String,
     age_secs: u64,
+    /// mtime 在未来(时钟回跳) —— 判定为 stale, 但要在 --status 里看得见
+    future: bool,
     fresh: bool,
 }
 
@@ -35,6 +37,18 @@ fn read_note(path: &std::path::Path) -> String {
         .unwrap_or(bytes.len())
         .min(60);
     String::from_utf8_lossy(&bytes[..end]).trim().to_string()
+}
+
+/// 判定一个 mtime 的新鲜度。返回 (年龄秒, 是否新鲜, 是否在未来)。
+///
+/// mtime 落在未来 => 时钟被回调过(CMOS 电池耗尽、双系统写 RTC、虚拟机快照恢复)。
+/// 必须视为 stale 而不是 fresh: 否则所有 hint 都永久"新鲜", 机器再也不睡,
+/// 而这恰恰是 TTL 机制存在的目的(写方崩溃不该把机器永久卡醒)。
+fn classify(now: SystemTime, mtime: SystemTime, ttl: Duration) -> (u64, bool, bool) {
+    match now.duration_since(mtime) {
+        Ok(age) => (age.as_secs(), age <= ttl, false),
+        Err(_) => (0, false, true),
+    }
 }
 
 impl Detector for HintDetector {
@@ -64,13 +78,13 @@ impl Detector for HintDetector {
             let Ok(mtime) = e.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            // mtime 可能因时钟调整落在未来, duration_since 会失败 -> 视为刚刷新
-            let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+            let (age_secs, fresh, future) = classify(now, mtime, ttl);
             self.last.push(HintRead {
                 name: e.file_name().to_string_lossy().to_string(),
                 note: read_note(&path),
-                age_secs: age.as_secs(),
-                fresh: age <= ttl,
+                age_secs,
+                future,
+                fresh,
             });
         }
 
@@ -105,10 +119,83 @@ impl Detector for HintDetector {
                 "    {:<28} age={:>4}s {} {}",
                 h.name,
                 h.age_secs,
-                if h.fresh { "fresh " } else { "STALE " },
+                if h.future {
+                    "FUTURE"
+                } else if h.fresh {
+                    "fresh "
+                } else {
+                    "STALE "
+                },
                 h.note
             ));
         }
         lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TTL: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn fresh_within_ttl() {
+        let now = SystemTime::now();
+        let (age, fresh, future) = classify(now, now - Duration::from_secs(10), TTL);
+        assert_eq!(age, 10);
+        assert!(fresh);
+        assert!(!future);
+    }
+
+    #[test]
+    fn stale_beyond_ttl() {
+        let now = SystemTime::now();
+        let (age, fresh, future) = classify(now, now - Duration::from_secs(300), TTL);
+        assert_eq!(age, 300);
+        assert!(!fresh, "超过 TTL 必须过期 —— 写方崩溃不该把机器永久卡醒");
+        assert!(!future);
+    }
+
+    #[test]
+    fn exactly_at_ttl_is_still_fresh() {
+        let now = SystemTime::now();
+        let (_, fresh, _) = classify(now, now - TTL, TTL);
+        assert!(fresh);
+    }
+
+    /// 核心回归: 时钟回跳(CMOS 电池耗尽/双系统写 RTC/快照恢复)后
+    /// mtime 落在未来, 必须判为 stale。否则机器永远不睡。
+    #[test]
+    fn future_mtime_is_stale_not_fresh() {
+        let now = SystemTime::now();
+        let (_, fresh, future) = classify(now, now + Duration::from_secs(8 * 3600), TTL);
+        assert!(!fresh, "未来 mtime 必须视为过期");
+        assert!(future, "要标记出来以便 --status 里看得见");
+    }
+
+    #[test]
+    fn note_reads_first_line_only() {
+        let dir = std::env::temp_dir().join("stayawake_hint_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("t.hint");
+        std::fs::write(&f, "first line\nsecond line\n").unwrap();
+        assert_eq!(read_note(&f), "first line");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn note_truncates_long_content() {
+        let dir = std::env::temp_dir().join("stayawake_hint_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("long.hint");
+        std::fs::write(&f, "x".repeat(500)).unwrap();
+        assert!(read_note(&f).len() <= 60);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn note_of_missing_file_is_empty() {
+        assert_eq!(read_note(std::path::Path::new("Z:\\nope\\nope.hint")), "");
     }
 }

@@ -153,3 +153,85 @@ pub fn is_installed() -> bool {
     run("schtasks", &["/query", "/tn", TASK_NAME])
         || run("reg", &["query", RUN_KEY, "/v", RUN_VALUE])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// XML 必须显式关掉三个会静默坏事的默认值。
+    /// 少任何一条都会导致"看起来注册成功了, 实际不生效"。
+    #[test]
+    fn task_xml_disables_the_three_traps() {
+        let xml = task_xml();
+        assert!(
+            xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"),
+            "默认 true -> 电池下根本不启动"
+        );
+        assert!(
+            xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"),
+            "默认 true -> 拔电就被杀"
+        );
+        assert!(
+            xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+            "默认 3 天 -> 到点被杀"
+        );
+        assert!(
+            xml.contains("<StopOnIdleEnd>false</StopOnIdleEnd>"),
+            "空闲结束不该停"
+        );
+    }
+
+    /// 必须运行在交互会话: session 0 的服务看不到用户的音频会话
+    #[test]
+    fn task_runs_in_interactive_session() {
+        let xml = task_xml();
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"), "不该要求提权");
+        assert!(xml.contains("<LogonTrigger>"), "应为登录触发");
+    }
+
+    #[test]
+    fn task_xml_is_well_formed_utf16_declaration() {
+        let xml = task_xml();
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"));
+        assert_eq!(xml.matches("<Task").count(), 1);
+        assert_eq!(xml.matches("</Task>").count(), 1);
+    }
+
+    #[test]
+    fn xml_escaping_handles_special_chars() {
+        assert_eq!(esc("a&b"), "a&amp;b");
+        assert_eq!(esc("<x>"), "&lt;x&gt;");
+        assert_eq!(esc("\"q\""), "&quot;q&quot;");
+        assert_eq!(esc("plain"), "plain");
+    }
+
+    /// 路径含 & 或空格(本项目路径就带空格)时 XML 不能被破坏
+    #[test]
+    fn exe_path_is_escaped_in_xml() {
+        let xml = task_xml();
+        // current_exe 里的裸 & 必须已被转义
+        let cmd_start = xml.find("<Command>").unwrap();
+        let cmd_end = xml.find("</Command>").unwrap();
+        let cmd = &xml[cmd_start + 9..cmd_end];
+        assert!(!cmd.contains(" & "), "未转义的 & 会破坏 XML: {}", cmd);
+    }
+
+    #[test]
+    fn utf16_writer_emits_bom() {
+        let tmp = std::env::temp_dir().join("stayawake_bom_test.xml");
+        write_utf16(&tmp, "ab").unwrap();
+        let bytes = std::fs::read(&tmp).unwrap();
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE], "schtasks /xml 要求 UTF-16LE BOM");
+        assert_eq!(&bytes[2..], &[b'a', 0, b'b', 0]);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// is_installed 只是查询, 不该修改任何状态, 且必须能重复调用
+    #[test]
+    fn is_installed_is_idempotent_query() {
+        let a = is_installed();
+        let b = is_installed();
+        assert_eq!(a, b);
+    }
+}

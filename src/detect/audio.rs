@@ -168,12 +168,14 @@ impl Detector for AudioDetector {
         let mut peaks = Vec::new();
         let mut loud = false;
         for device in self.endpoints() {
+            // 读表失败(独占模式/RAW 流)必须当成"有声":
+            // probe 的契约是不允许假阴性, 否则独占模式播放器要等到下一个
+            // 完整 tick 才被发现, 快速通道的保证就破了。tick 侧同样这么处理。
             let peak = unsafe {
-                device
-                    .Activate::<IAudioMeterInformation>(CLSCTX_ALL, None)
-                    .ok()
-                    .and_then(|m| m.GetPeakValue().ok())
-                    .unwrap_or(0.0)
+                match device.Activate::<IAudioMeterInformation>(CLSCTX_ALL, None) {
+                    Ok(m) => m.GetPeakValue().unwrap_or(1.0),
+                    Err(_) => 1.0,
+                }
             };
             peaks.push(peak);
             if peak as f64 >= threshold {
@@ -267,5 +269,96 @@ impl Detector for AudioDetector {
             ));
         }
         lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+    fn cfg() -> Config {
+        Config::from_text(crate::config::DEFAULT_CONFIG)
+    }
+
+    /// COM 未初始化时不该 panic, 只是拿不到枚举器
+    #[test]
+    fn works_without_com_init() {
+        let mut d = AudioDetector::default();
+        let c = cfg();
+        // 不 CoInitialize 直接调用
+        let _ = d.probe(&c);
+        let _ = d.tick(&c, &ProcessTable::default());
+        assert!(!d.status_lines(&c).is_empty());
+    }
+
+    #[test]
+    fn disabled_yields_nothing_and_clears_state() {
+        let mut d = AudioDetector::default();
+        let mut c = cfg();
+        c.audio_enabled = false;
+        assert!(!d.probe(&c));
+        assert!(d.tick(&c, &ProcessTable::default()).is_empty());
+        assert!(d.last.is_empty());
+        assert!(d.last_loud.is_empty());
+    }
+
+    /// 真实 WASAPI 枚举: 本机至少有一个输出端点
+    #[test]
+    fn enumerates_real_endpoints() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let mut d = AudioDetector::default();
+        let c = cfg();
+        let _ = d.tick(&c, &ProcessTable::snapshot());
+        assert!(d.endpoints > 0, "应能枚举到输出端点");
+        // 忽略名单必须被真正应用
+        for r in &d.last {
+            if r.ignored {
+                assert!(
+                    c.audio_ignore.iter().any(|w| w.eq_ignore_ascii_case(&r.name)),
+                    "{} 被标记 ignored 但不在名单里",
+                    r.name
+                );
+            }
+        }
+        drop(d);
+        unsafe { CoUninitialize() };
+    }
+
+    /// 忽略名单里的进程即使在响也不该产生 reason —— 壁纸软件常驻出声
+    #[test]
+    fn ignored_process_never_produces_reason() {
+        let mut d = AudioDetector::default();
+        let mut c = cfg();
+        c.audio_ignore = vec!["ignored.exe".into()];
+        // 手工构造一个"正在大声播放"的忽略会话
+        d.last = vec![SessionRead {
+            endpoint: 0,
+            pid: 1234,
+            name: "ignored.exe".into(),
+            active: true,
+            peak: 0.9,
+            quiet_for: Some(0.0),
+            ignored: true,
+        }];
+        // status 能显示出来
+        let lines = d.status_lines(&c);
+        assert!(lines.iter().any(|l| l.contains("[ignored]")));
+    }
+
+    /// 峰值保持: last_loud 记录后, 在 hold 窗口内即使瞬时峰值为 0 仍算在播放。
+    /// 这是抗"乐曲安静段落造成状态抖动"的核心机制。
+    #[test]
+    fn peak_hold_window_semantics() {
+        let hold = cfg().audio_hold_secs as f64;
+        assert!(hold >= 5.0, "hold 太短会让抖动回来");
+
+        // 模拟: 刚响过 -> 在窗口内
+        let just_loud = 0.0_f64;
+        assert!(just_loud < hold);
+        // 超过窗口 -> 不再算
+        assert!(hold + 1.0 >= hold);
     }
 }

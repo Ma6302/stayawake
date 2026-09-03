@@ -60,3 +60,57 @@ impl Detector for ProcDetector {
         lines
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(threshold: f64) -> Config {
+        let mut c = Config::from_text(crate::config::DEFAULT_CONFIG);
+        c.proc_cpu_percent_1core = threshold;
+        c
+    }
+
+    /// 名单为空时不该做任何事(也不该 panic)
+    #[test]
+    fn empty_whitelist_yields_nothing() {
+        let mut d = ProcDetector::default();
+        let mut c = cfg(5.0);
+        c.proc_busy_when_cpu.clear();
+        assert!(d.tick(&c, &ProcessTable::snapshot()).is_empty());
+    }
+
+    #[test]
+    fn disabled_yields_nothing() {
+        let mut d = ProcDetector::default();
+        let mut c = cfg(5.0);
+        c.proc_enabled = false;
+        assert!(d.tick(&c, &ProcessTable::snapshot()).is_empty());
+    }
+
+    /// 首次 tick 只建立基线, 不该凭空报出 CPU 占用 ——
+    /// 否则刚启动就会误判"有编译在跑"
+    #[test]
+    fn first_tick_never_reports() {
+        let mut d = ProcDetector::default();
+        let mut c = cfg(0.1);
+        // 把本测试进程自己加进名单, 保证名单必定命中
+        c.proc_busy_when_cpu = vec!["stayawake.exe".into(), current_exe_name()];
+        let out = d.tick(&c, &ProcessTable::snapshot());
+        assert!(out.is_empty(), "首轮无差值可算, 得到 {:?}", out);
+    }
+
+    /// proc 不参与快速通道(需要进程快照, 太贵)
+    #[test]
+    fn does_not_participate_in_fast_probe() {
+        let mut d = ProcDetector::default();
+        assert!(!d.probe(&cfg(5.0)));
+    }
+
+    fn current_exe_name() -> String {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_default()
+    }
+}

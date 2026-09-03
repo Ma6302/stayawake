@@ -23,7 +23,7 @@ use windows::Win32::System::Power::{POWERBROADCAST_SETTING, RegisterPowerSetting
 use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    NOTIFYICONDATAW, NOTIFY_ICON_MESSAGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CheckMenuItem, CreateIconIndirect, CreatePopupMenu,
@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetMenuItemInfoW,
     SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, CW_USEDEFAULT,
     DEVICE_NOTIFY_WINDOW_HANDLE, HC_ACTION, HHOOK, HICON, HMENU, ICONINFO, IDC_ARROW,
-    MB_ICONINFORMATION, MB_OK, MENUITEMINFOW, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MENUITEMINFOW, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MIIM_STRING, MOUSEHOOKSTRUCT, MSG,
     PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, TPM_LEFTALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_MOUSE, WINDOW_STYLE, WM_APP, WM_COMMAND,
@@ -82,6 +82,10 @@ pub fn run(shared: Arc<Shared>, hwnd_tx: mpsc::Sender<HWND>) {
         unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
         Ordering::SeqCst,
     );
+    // 预热自启状态缓存: 这两个子进程要跑数百 ms, 放在这里比第一次开菜单时跑好
+    std::thread::spawn(|| {
+        AUTOSTART_CACHE.store(crate::autostart::is_installed() as i8, Ordering::SeqCst);
+    });
 
     unsafe {
         let hinstance = HINSTANCE(GetModuleHandleW(None).unwrap().0);
@@ -151,14 +155,19 @@ enum Look {
 
 fn current_look() -> Look {
     let s = shared();
-    match *s.mode.lock().unwrap() {
+    // 两个锁分开取, 不嵌套 —— 避免建立隐式锁序(match 的临时值会活到整个 match 结束)
+    let mode = *s.mode.lock().unwrap();
+    match mode {
         Mode::Paused => Look::Paused,
         Mode::Force(_) => Look::Force,
-        Mode::Auto => match s.snapshot.lock().unwrap().as_ref().map(|x| x.held) {
-            Some(Held::System) => Look::System,
-            Some(Held::SystemDisplay) => Look::SystemDisplay,
-            _ => Look::Idle,
-        },
+        Mode::Auto => {
+            let held = s.snapshot.lock().unwrap().as_ref().map(|x| x.held);
+            match held {
+                Some(Held::System) => Look::System,
+                Some(Held::SystemDisplay) => Look::SystemDisplay,
+                _ => Look::Idle,
+            }
+        }
     }
 }
 
@@ -193,24 +202,28 @@ fn fill_tip(nid: &mut NOTIFYICONDATAW, text: &str) {
 }
 
 fn add_icon(hwnd: HWND) {
-    unsafe {
-        let mut nid = base_nid(hwnd);
-        let icon = draw_icon(current_look());
-        nid.hIcon = icon;
-        fill_tip(&mut nid, &current_tip());
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-        let _ = DestroyIcon(icon);
-    }
+    notify(hwnd, NIM_ADD);
 }
 
 fn refresh_icon(hwnd: HWND) {
+    notify(hwnd, NIM_MODIFY);
+}
+
+/// 更新托盘项。图标绘制失败(GDI 耗尽)时只更新 tooltip, 保留旧图标 ——
+/// 总比整个进程 abort 好。
+fn notify(hwnd: HWND, msg: NOTIFY_ICON_MESSAGE) {
     unsafe {
         let mut nid = base_nid(hwnd);
         let icon = draw_icon(current_look());
-        nid.hIcon = icon;
+        match icon {
+            Some(h) => nid.hIcon = h,
+            None => nid.uFlags &= !NIF_ICON,
+        }
         fill_tip(&mut nid, &current_tip());
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-        let _ = DestroyIcon(icon);
+        let _ = Shell_NotifyIconW(msg, &nid);
+        if let Some(h) = icon {
+            let _ = DestroyIcon(h);
+        }
     }
 }
 
@@ -223,10 +236,25 @@ fn remove_icon(hwnd: HWND) {
 
 /// 32x32 32bpp DIB 上画个实心圆, 颜色即状态。掩码位图必须与颜色位图同尺寸,
 /// 传 1x1 会让 CreateIconIndirect 返回 E_INVALIDARG。
-fn draw_icon(look: Look) -> HICON {
+///
+/// 全程用 `?` 而非 `expect`: 这个函数的失败原因恰恰是 GDI 句柄耗尽,
+/// 若在中途 panic 会漏掉已创建的对象 -> 下次更容易失败 -> 泄漏自我强化。
+/// 而且 panic 会跨 `extern "system"` 的 wnd_proc 边界导致整个进程 abort。
+/// 返回 None 时调用方降级为"不更新图标", 托盘保留上一个图标。
+fn draw_icon(look: Look) -> Option<HICON> {
     const SIZE: i32 = 32;
     unsafe {
         let hdc: HDC = CreateCompatibleDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        // 任何一步失败都要把已经拿到的对象还回去
+        let cleanup = |bmps: &[HGDIOBJ]| {
+            for b in bmps {
+                let _ = DeleteObject(*b);
+            }
+            let _ = DeleteDC(hdc);
+        };
 
         let mut bmi: BITMAPINFO = std::mem::zeroed();
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -239,8 +267,14 @@ fn draw_icon(look: Look) -> HICON {
             ..Default::default()
         };
         let mut bits: *mut c_void = std::ptr::null_mut();
-        let color_bmp =
-            CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).expect("CreateDIBSection");
+        let Ok(color_bmp) = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            cleanup(&[]);
+            return None;
+        };
+        if bits.is_null() {
+            cleanup(&[HGDIOBJ(color_bmp.0)]);
+            return None;
+        }
         let old_bmp = SelectObject(hdc, color_bmp);
 
         // 全透明底 (alpha = 0)
@@ -287,8 +321,12 @@ fn draw_icon(look: Look) -> HICON {
             ..Default::default()
         };
         let mut mask_bits: *mut c_void = std::ptr::null_mut();
-        let mask_bmp = CreateDIBSection(hdc, &mask_bmi, DIB_RGB_COLORS, &mut mask_bits, None, 0)
-            .expect("CreateDIBSection(mask)");
+        let Ok(mask_bmp) =
+            CreateDIBSection(hdc, &mask_bmi, DIB_RGB_COLORS, &mut mask_bits, None, 0)
+        else {
+            cleanup(&[HGDIOBJ(color_bmp.0)]);
+            return None;
+        };
 
         let info = ICONINFO {
             fIcon: true.into(),
@@ -297,11 +335,9 @@ fn draw_icon(look: Look) -> HICON {
             hbmMask: mask_bmp,
             hbmColor: color_bmp,
         };
-        let icon = CreateIconIndirect(&info).expect("CreateIconIndirect");
-
-        let _ = DeleteObject(HGDIOBJ(mask_bmp.0));
-        let _ = DeleteObject(HGDIOBJ(color_bmp.0));
-        let _ = DeleteDC(hdc);
+        // CreateIconIndirect 会复制位图, 所以之后删掉它们是对的
+        let icon = CreateIconIndirect(&info).ok();
+        cleanup(&[HGDIOBJ(mask_bmp.0), HGDIOBJ(color_bmp.0)]);
         icon
     }
 }
@@ -319,18 +355,22 @@ static MENU_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static MENU_WINDOW: AtomicIsize = AtomicIsize::new(0);
 /// 上次选的是哪个"强制常亮"时长, 用于把勾画在正确的那一项上
 static FORCE_PICK: AtomicUsize = AtomicUsize::new(0);
-/// autostart 查询要跑 schtasks + reg, 每次开菜单都查会明显卡顿 -> 缓存
-/// (-1 未知, 0 否, 1 是); 只有我们自己会改它, 所以缓存是安全的
+/// autostart 查询要跑 schtasks + reg 两个子进程(数百 ms), 绝不能在
+/// UI 线程/鼠标钩子里同步做 -> 全程走缓存。
+/// (-1 未知, 0 否, 1 是); 启动时由后台线程预热, 只有我们自己会改它。
 static AUTOSTART_CACHE: AtomicI8 = AtomicI8::new(-1);
 
+/// 读缓存。未知时返回 false 并触发一次后台查询 —— 绝不阻塞调用方。
 fn autostart_installed() -> bool {
     match AUTOSTART_CACHE.load(Ordering::SeqCst) {
-        0 => false,
         1 => true,
+        0 => false,
         _ => {
-            let v = crate::autostart::is_installed();
-            AUTOSTART_CACHE.store(v as i8, Ordering::SeqCst);
-            v
+            // 未知: 后台查一次, 本次先按"未安装"显示。下次开菜单就是准的。
+            std::thread::spawn(|| {
+                AUTOSTART_CACHE.store(crate::autostart::is_installed() as i8, Ordering::SeqCst);
+            });
+            false
         }
     }
 }
@@ -641,13 +681,24 @@ fn handle_command(hwnd: HWND, id: usize) {
         ID_POLICY_AC => toggle_policy("policy_ac", &cfg.policy_ac),
         ID_POLICY_DC => toggle_policy("policy_dc", &cfg.policy_dc),
         ID_AUTOSTART => {
-            let msg = if autostart_installed() {
-                crate::autostart::uninstall()
-            } else {
-                crate::autostart::install()
-            };
-            AUTOSTART_CACHE.store(-1, Ordering::SeqCst); // 强制下次重查
-            log::event(&msg);
+            // schtasks/reg 子进程要跑数百 ms 到数秒。这里可能在 WH_MOUSE 钩子里
+            // (菜单打开期间), 同步执行会冻结整个线程的输入队列。
+            //
+            // 做法: 立刻把缓存乐观地翻转(勾选马上响应), 真正的操作丢到后台线程,
+            // 完成后用实际结果校正缓存。这样 sync_menu_state 也不会再去跑子进程。
+            let known = AUTOSTART_CACHE.load(Ordering::SeqCst);
+            let installing = known != 1; // -1(未知) 视作未安装 -> 本次是安装
+            AUTOSTART_CACHE.store(installing as i8, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let msg = if installing {
+                    crate::autostart::install()
+                } else {
+                    crate::autostart::uninstall()
+                };
+                log::event(&msg);
+                // 用真实状态校正乐观值(操作可能失败)
+                AUTOSTART_CACHE.store(crate::autostart::is_installed() as i8, Ordering::SeqCst);
+            });
         }
         ID_OPEN_LOG => log::open_in_editor(&config::log_path()),
         ID_OPEN_CFG => log::open_in_editor(&config::config_path()),
@@ -665,15 +716,34 @@ fn set_mode(mode: Mode) {
 }
 
 fn toggle(key: &str, current: bool) {
-    let mut cfg = Config::load_or_create();
-    cfg.set_and_save(key, if current { "false" } else { "true" });
-    request_reload();
+    save_setting(key, if current { "false" } else { "true" });
 }
 
 fn toggle_policy(key: &str, current: &str) {
+    save_setting(key, if current == "display" { "system" } else { "display" });
+}
+
+/// 写配置项并让 worker 重载。落盘失败要记日志 + 弹窗:
+/// 否则勾看起来变了、下次加载又变回去, 用户无从知晓。
+fn save_setting(key: &str, value: &str) {
     let mut cfg = Config::load_or_create();
-    cfg.set_and_save(key, if current == "display" { "system" } else { "display" });
-    request_reload();
+    match cfg.set_and_save(key, value) {
+        Ok(()) => request_reload(),
+        Err(e) => {
+            let msg = format!("无法保存配置项 {} = {}\r\n\r\n{}", key, value, e);
+            log::event(&format!("warn: set_and_save({}) 失败: {}", key, e));
+            let mut w: Vec<u16> = msg.encode_utf16().collect();
+            w.push(0);
+            unsafe {
+                MessageBoxW(
+                    HWND::default(),
+                    PCWSTR(w.as_ptr()),
+                    w!("stayawake"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+        }
+    }
 }
 
 fn request_reload() {

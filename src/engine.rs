@@ -61,7 +61,11 @@ pub struct Engine {
     detectors: Vec<Box<dyn Detector>>,
     /// 最近一次检测到活动的时刻, 用于宽限期
     last_active: Option<Instant>,
+    /// 上一轮是否处于宽限期
+    in_grace: bool,
     held: Held,
+    /// apply_hold 失败告警闩锁, 防止日志刷屏
+    hold_warned: bool,
 }
 
 impl Engine {
@@ -75,12 +79,19 @@ impl Engine {
                 Box::new(detect::hint::HintDetector::default()),
             ],
             last_active: None,
+            in_grace: false,
             held: Held::None,
+            hold_warned: false,
         }
     }
 
     pub fn held(&self) -> Held {
         self.held
+    }
+
+    /// 上一轮 step 是否处于宽限期。给 sleep_on_release 判断"是否为自然释放"用。
+    pub fn in_grace(&self) -> bool {
+        self.in_grace
     }
 
     /// 跑一轮检测, 返回聚合后的理由(同一 kind 合并为一条)
@@ -127,6 +138,7 @@ impl Engine {
             && self
                 .last_active
                 .is_some_and(|t| now.duration_since(t) < Duration::from_secs(cfg.grace_secs));
+        self.in_grace = in_grace;
         let busy = !reasons.is_empty() || in_grace;
 
         let ac = power::power_source() != PowerSource::Dc;
@@ -140,9 +152,15 @@ impl Engine {
         if changed {
             if power::apply_hold(desired) {
                 self.held = desired;
+                self.hold_warned = false;
             } else {
-                // SetThreadExecutionState 失败: 保持旧状态, 下一 tick 重试
-                crate::log::event("warn: SetThreadExecutionState failed");
+                // SetThreadExecutionState 失败: 保持旧状态, 下一 tick 重试。
+                // 只告警一次 —— 否则持续失败会以 fast_poll 频率刷日志,
+                // 1MB 轮转只留一代, 全部历史会被冲掉。
+                if !self.hold_warned {
+                    self.hold_warned = true;
+                    crate::log::event("warn: SetThreadExecutionState failed (后续不再重复告警)");
+                }
             }
         }
 
@@ -193,4 +211,109 @@ fn decide(cfg: &Config, ac: bool, display_on: bool, busy: bool) -> Held {
         return Held::System;
     }
     Held::SystemDisplay
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(ac: &str, dc: &str, never_wake: bool) -> Config {
+        let mut c = Config::from_text(crate::config::DEFAULT_CONFIG);
+        c.policy_ac = ac.to_string();
+        c.policy_dc = dc.to_string();
+        c.never_wake_display = never_wake;
+        c
+    }
+
+    #[test]
+    fn idle_never_holds() {
+        for ac in [true, false] {
+            for disp in [true, false] {
+                let c = cfg_with("display", "display", false);
+                assert_eq!(decide(&c, ac, disp, false), Held::None);
+            }
+        }
+    }
+
+    /// 默认策略: 插电只防睡(让屏幕正常熄掉省电), 电池保屏幕
+    /// (电池下 system-required 会在睡眠超时后约 5 分钟被系统强制清除)
+    #[test]
+    fn default_policy_truth_table() {
+        let c = Config::from_text(crate::config::DEFAULT_CONFIG);
+        assert_eq!(decide(&c, true, true, true), Held::System, "AC 屏幕亮");
+        assert_eq!(decide(&c, true, false, true), Held::System, "AC 屏幕已熄");
+        assert_eq!(decide(&c, false, true, true), Held::SystemDisplay, "DC 屏幕亮");
+        // DC + 屏幕已熄 + never_wake_display -> 不主动点亮, 降级为仅防睡
+        assert_eq!(decide(&c, false, false, true), Held::System, "DC 屏幕已熄");
+    }
+
+    #[test]
+    fn never_wake_display_off_allows_waking_screen() {
+        let c = cfg_with("system", "display", false);
+        assert_eq!(
+            decide(&c, false, false, true),
+            Held::SystemDisplay,
+            "关掉 never_wake_display 后应主动点亮"
+        );
+    }
+
+    #[test]
+    fn display_policy_on_ac_keeps_screen() {
+        let c = cfg_with("display", "system", true);
+        assert_eq!(decide(&c, true, true, true), Held::SystemDisplay);
+        assert_eq!(decide(&c, false, true, true), Held::System, "DC 用 system 策略");
+    }
+
+    #[test]
+    fn unknown_policy_falls_back_to_system() {
+        let c = cfg_with("乱写", "乱写", true);
+        assert_eq!(decide(&c, true, true, true), Held::System);
+        assert_eq!(decide(&c, false, true, true), Held::System);
+    }
+
+    /// Held 的 flags 必须始终带 ES_CONTINUOUS, 否则只是"戳一下计时器"而非粘性持有
+    #[test]
+    fn held_flags_are_sticky() {
+        const ES_CONTINUOUS: u32 = 0x8000_0000;
+        const ES_SYSTEM: u32 = 0x0000_0001;
+        const ES_DISPLAY: u32 = 0x0000_0002;
+        assert_eq!(Held::None.flags(), ES_CONTINUOUS);
+        assert_eq!(Held::System.flags(), ES_CONTINUOUS | ES_SYSTEM);
+        assert_eq!(
+            Held::SystemDisplay.flags(),
+            ES_CONTINUOUS | ES_SYSTEM | ES_DISPLAY
+        );
+    }
+
+    #[test]
+    fn describe_reflects_mode_over_held() {
+        let snap = Snapshot {
+            held: Held::System,
+            mode: Mode::Paused,
+            reasons: vec!["audio:foo".into()],
+            in_grace: false,
+            ac: true,
+            display_on: true,
+            force_left: None,
+        };
+        assert!(snap.describe().contains("已暂停"), "暂停时不该显示持有原因");
+
+        let snap2 = Snapshot { mode: Mode::Auto, ..snap.clone() };
+        assert!(snap2.describe().contains("audio:foo"));
+
+        let idle = Snapshot {
+            held: Held::None,
+            reasons: vec![],
+            ..snap2.clone()
+        };
+        assert!(idle.describe().contains("空闲"));
+
+        let grace = Snapshot {
+            held: Held::System,
+            reasons: vec![],
+            in_grace: true,
+            ..snap2
+        };
+        assert!(grace.describe().contains("宽限期"));
+    }
 }
