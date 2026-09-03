@@ -47,31 +47,67 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// 一行式说明"为什么不休眠", 给 tooltip / 菜单标题用
+    /// 一行式说明"为什么不休眠", 前面带当前供电状态。给 tooltip 用
+    /// (`szTip` 只有 128 个 wchar, 拆行反而更容易被截断)。
     pub fn describe(&self) -> String {
-        match self.mode {
-            Mode::Paused => "已暂停 · 允许正常休眠".to_string(),
+        self.describe_lines().join(" · ")
+    }
+
+    /// 三段状态: **供电 / 在做什么 / 为什么**。菜单顶部按这三段分三行显示。
+    ///
+    /// 返回结构而不是让调用方去 split(" · "): 原因本身可能含 " · "
+    /// (多个检测器同时命中就是 `self.reasons.join(" · ")`), 按分隔符切会切错。
+    pub fn describe_lines(&self) -> [String; 3] {
+        let (state, why) = match self.mode {
+            Mode::Paused => ("已暂停".to_string(), "允许正常休眠".to_string()),
             Mode::Force(_) => {
                 let left = self.force_left.unwrap_or_default().as_secs();
-                format!("强制常亮 · 剩余 {}分{}秒", left / 60, left % 60)
+                ("强制常亮".to_string(), format!("剩余 {}分{}秒", left / 60, left % 60))
             }
             Mode::Auto => match self.held {
-                Held::None => "空闲 · 未持有请求".to_string(),
+                Held::None => ("空闲".to_string(), "未持有请求".to_string()),
                 _ => {
-                    let what = if self.reasons.is_empty() {
+                    let how = if self.held == Held::SystemDisplay {
+                        "阻止熄屏"
+                    } else {
+                        "阻止睡眠"
+                    };
+                    let why = if self.reasons.is_empty() {
                         "宽限期".to_string()
                     } else {
                         self.reasons.join(" · ")
                     };
-                    let how = if self.held == Held::SystemDisplay {
-                        "保持屏幕"
-                    } else {
-                        "仅防睡"
-                    };
-                    format!("{} · {}", how, what)
+                    (how.to_string(), why)
                 }
             },
+        };
+        [self.power_label().to_string(), state, why]
+    }
+
+    /// 供电状态。策略是分插电/电池两套的, 所以哪一套在生效必须一眼看见 ——
+    /// 否则拔掉电源后菜单上的勾跟着变, 用户会以为自己刚设的值丢了。
+    pub fn power_label(&self) -> &'static str {
+        if self.ac {
+            "插电"
+        } else {
+            "电池"
         }
+    }
+
+    /// 只说状态, 不带供电前缀。给「当前状态详情」用 —— 那里供电已经单独一行了。
+    pub fn describe_state(&self) -> String {
+        let [_, state, why] = self.describe_lines();
+        format!("{} · {}", state, why)
+    }
+}
+
+/// 供电策略值 -> 人话。与 `decide` 的判据放在一起, 免得两边对"什么算 display"的
+/// 理解发生漂移: `decide` 是 `policy != "display"` 就按 system 处理。
+pub fn policy_label(policy: &str) -> &'static str {
+    if policy == "display" {
+        "阻止熄屏"
+    } else {
+        "阻止睡眠"
     }
 }
 
@@ -306,6 +342,129 @@ mod tests {
             Held::SystemDisplay.flags(),
             ES_CONTINUOUS | ES_SYSTEM | ES_DISPLAY
         );
+    }
+
+    /// 三行状态的切分必须与一行式一致, 且**每行都不能为空** ——
+    /// 空字符串会在菜单里渲染成一条莫名的空白项。
+    #[test]
+    fn describe_lines_split_into_three_nonempty_rows() {
+        let base = Snapshot {
+            held: Held::System,
+            mode: Mode::Auto,
+            reasons: vec!["audio:x".into()],
+            in_grace: false,
+            ac: true,
+            display_on: true,
+            force_left: None,
+        };
+        let cases = [
+            base.clone(),
+            Snapshot { mode: Mode::Paused, ..base.clone() },
+            Snapshot {
+                mode: Mode::Force(Instant::now() + Duration::from_secs(90)),
+                force_left: Some(Duration::from_secs(90)),
+                ..base.clone()
+            },
+            Snapshot { held: Held::None, reasons: vec![], ..base.clone() },
+            Snapshot { reasons: vec![], in_grace: true, ..base.clone() },
+            Snapshot { ac: false, ..base.clone() },
+        ];
+        for s in &cases {
+            let lines = s.describe_lines();
+            for (i, l) in lines.iter().enumerate() {
+                assert!(!l.trim().is_empty(), "第 {} 行为空: {:?}", i + 1, lines);
+            }
+            // 第一行只放供电, 第二行是"在做什么", 第三行是"为什么"
+            assert_eq!(lines[0], s.power_label());
+            // 一行式就是三行拼起来, 两处不能各说一套
+            assert_eq!(s.describe(), lines.join(" · "));
+            // describe_state 是后两行
+            assert_eq!(s.describe_state(), format!("{} · {}", lines[1], lines[2]));
+        }
+    }
+
+    /// 多个检测器同时命中时, 原因整段留在第三行 —— 不能按 " · " 再切开,
+    /// 否则行数会随命中数量变化, 而菜单的三行是固定项。
+    #[test]
+    fn multiple_reasons_stay_on_one_row() {
+        let s = Snapshot {
+            held: Held::SystemDisplay,
+            mode: Mode::Auto,
+            reasons: vec!["audio:a".into(), "net:12.0MB/s".into(), "hint:b".into()],
+            in_grace: false,
+            ac: false,
+            display_on: true,
+            force_left: None,
+        };
+        let lines = s.describe_lines();
+        assert_eq!(lines[0], "电池");
+        assert_eq!(lines[1], "阻止熄屏");
+        assert_eq!(lines[2], "audio:a · net:12.0MB/s · hint:b");
+    }
+
+    /// 供电状态必须出现在 describe() 的最前面, 且 describe_state() 里不能有 ——
+    /// 「当前状态详情」把供电单独列了一行, 重复一遍是噪音。
+    #[test]
+    fn describe_leads_with_power_source() {
+        let base = Snapshot {
+            held: Held::System,
+            mode: Mode::Auto,
+            reasons: vec!["net:12.0MB/s".into()],
+            in_grace: false,
+            ac: true,
+            display_on: true,
+            force_left: None,
+        };
+        assert!(base.describe().starts_with("插电 · "), "得到 {}", base.describe());
+        assert!(base.describe().contains("net:12.0MB/s"));
+        assert!(!base.describe_state().contains("插电"));
+
+        let dc = Snapshot { ac: false, ..base.clone() };
+        assert!(dc.describe().starts_with("电池 · "), "得到 {}", dc.describe());
+        assert_eq!(dc.power_label(), "电池");
+
+        // 暂停/强制常亮也要带上供电 —— 那两种状态下策略同样按供电分路
+        let paused = Snapshot { mode: Mode::Paused, ..base.clone() };
+        assert!(paused.describe().starts_with("插电 · "));
+        let forced = Snapshot {
+            mode: Mode::Force(Instant::now() + Duration::from_secs(60)),
+            force_left: Some(Duration::from_secs(60)),
+            ..base
+        };
+        assert!(forced.describe().starts_with("插电 · "));
+    }
+
+    /// 持有状态的说法必须与菜单项一致(阻止熄屏 / 阻止睡眠), 不能各叫各的
+    #[test]
+    fn describe_uses_the_same_words_as_the_menu() {
+        let base = Snapshot {
+            held: Held::SystemDisplay,
+            mode: Mode::Auto,
+            reasons: vec!["audio:x".into()],
+            in_grace: false,
+            ac: true,
+            display_on: true,
+            force_left: None,
+        };
+        assert!(base.describe_state().starts_with("阻止熄屏"), "得到 {}", base.describe_state());
+        assert_eq!(policy_label("display"), "阻止熄屏");
+
+        let sys = Snapshot { held: Held::System, ..base };
+        assert!(sys.describe_state().starts_with("阻止睡眠"), "得到 {}", sys.describe_state());
+        assert_eq!(policy_label("system"), "阻止睡眠");
+    }
+
+    /// `policy_label` 必须和 `decide` 对"什么算 display"的判据一致:
+    /// 非法值在 decide 里按 system 处理, 标签也必须说"阻止睡眠"。
+    #[test]
+    fn policy_label_matches_decide_fallback() {
+        for p in ["system", "乱写", "", "DISPLAY"] {
+            let c = cfg_with(p, p, true);
+            let held = decide(&c, true, true, true);
+            let expected = if held == Held::SystemDisplay { "阻止熄屏" } else { "阻止睡眠" };
+            assert_eq!(policy_label(p), expected, "策略值 {:?}", p);
+        }
+        assert_eq!(policy_label("display"), "阻止熄屏");
     }
 
     #[test]

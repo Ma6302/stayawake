@@ -31,11 +31,14 @@ fast_poll_secs = 2
 # 活动停止后继续保持的宽限期(秒), 防止音乐换歌/编译间隙来回抖动
 grace_secs = 90
 
-# 供电策略: system = 只阻止睡眠(允许熄屏) / display = 同时保持屏幕常亮
+# 供电策略: system = 只阻止睡眠(允许屏幕正常熄掉) / display = 同时阻止熄屏
+# 托盘菜单里这两项叫「阻止睡眠」和「阻止熄屏」, 且只呈现当前生效的那一路 ——
+# 插电时改下面的 policy_ac, 电池时改 policy_dc。两路始终独立, 想同时看到就看这里。
+#
 # 插电时 system-required 可无限阻塞睡眠, 所以让屏幕正常熄掉最省电
 policy_ac = system
 # 电池下 system-required 在睡眠超时后约 5 分钟会被系统强制清除,
-# 只有 display-required 不受此限 -> 电池默认保屏幕
+# 只有 display-required 不受此限 -> 电池默认阻止熄屏
 policy_dc = display
 
 # true = 屏幕已经熄了就不主动点亮(降级为仅防睡)。半夜下载启动不会闪亮屏

@@ -53,7 +53,10 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 // 菜单项 ID
+/// 顶部状态块的三行(供电 / 在做什么 / 为什么), 都是 disabled 的展示行
 const ID_TITLE: usize = 100;
+const ID_TITLE_STATE: usize = 101;
+const ID_TITLE_WHY: usize = 102;
 const ID_AUTO: usize = 110;
 const ID_PAUSE: usize = 111;
 const ID_FORCE_30M: usize = 120;
@@ -65,8 +68,10 @@ const ID_DET_NET: usize = 131;
 const ID_DET_PROC: usize = 132;
 const ID_DET_DL: usize = 133;
 const ID_DET_HINT: usize = 134;
-const ID_POLICY_AC: usize = 140;
-const ID_POLICY_DC: usize = 141;
+/// 这两项作用于**当前生效的那一路**供电(插电或电池), 不是固定的 AC/DC。
+/// 编号沿用原来的 140/141, 但语义变了: 原来是"插电/电池各一个开关"。
+const ID_POLICY_DISPLAY: usize = 140;
+const ID_POLICY_SYSTEM: usize = 141;
 const ID_AUTOSTART: usize = 142;
 const ID_OPEN_LOG: usize = 150;
 const ID_OPEN_CFG: usize = 151;
@@ -147,6 +152,29 @@ fn shared() -> &'static Arc<Shared> {
 /// 会让菜单仍勾着"强制常亮"、标题显示"剩余 0 分 0 秒", 而实际判定早已按 Auto 走。
 fn current_mode() -> Mode {
     shared().mode.lock().unwrap().effective()
+}
+
+/// 当前生效的供电来源。优先取 worker 快照 —— 那才是判定真正依据的值,
+/// 而且 `PBT_APMPOWERSTATUSCHANGE` 会立刻踢醒 worker, 所以它不会陈旧。
+/// 首轮检测还没跑完时(快照为 None)退回直接查询。
+fn current_ac() -> bool {
+    match shared().snapshot.lock().unwrap().as_ref() {
+        Some(s) => s.ac,
+        None => crate::power::power_source() != crate::power::PowerSource::Dc,
+    }
+}
+
+/// 两个供电策略菜单项的标题。
+///
+/// **标题里带上当前供电来源**是有意的: 这两项只作用于生效中的那一路, 而两路的值
+/// 始终独立存储。不写清楚的话, 用户在插电下选了"阻止熄屏", 拔掉电源再开菜单会看到
+/// 勾跑到了"阻止睡眠"上 —— 看起来像刚设的值丢了, 实际只是切到了另一路。
+fn policy_items(ac: bool) -> (String, String) {
+    let src = if ac { "插电" } else { "电池" };
+    (
+        format!("{}: 阻止熄屏", src),
+        format!("{}: 阻止睡眠 (允许熄屏)", src),
+    )
 }
 
 // ───────────────────────────── 托盘图标 ─────────────────────────────
@@ -494,13 +522,23 @@ fn autostart_installed() -> bool {
     }
 }
 
-/// 顶部状态行。用**实时** mode 而非快照里的, 这样点完立刻能看到变化
+/// 顶部状态块的三行。用**实时** mode 而非快照里的, 这样点完立刻能看到变化
 /// (worker 虽然会被立即踢醒, 但快照更新总比这里晚一点)
-fn menu_title() -> String {
+fn menu_title_lines() -> [String; 3] {
     match live_snapshot() {
-        Some(snap) => snap.describe(),
-        None => "启动中...".to_string(),
+        Some(snap) => snap.describe_lines(),
+        // 首轮检测还没跑完。三行都得有内容 —— 空字符串会渲染成一条空白菜单项
+        None => [
+            if current_ac() { "插电".into() } else { "电池".into() },
+            "启动中...".into(),
+            "尚未完成首轮检测".into(),
+        ],
     }
+}
+
+/// 这三行是纯展示, 点击不该做任何事
+fn is_title(id: usize) -> bool {
+    matches!(id, ID_TITLE | ID_TITLE_STATE | ID_TITLE_WHY)
 }
 
 fn build_menu() -> HMENU {
@@ -508,14 +546,26 @@ fn build_menu() -> HMENU {
     let mode = current_mode();
     let forced = matches!(mode, Mode::Force(_));
     let force_pick = FORCE_PICK.load(Ordering::SeqCst);
+    // 只呈现当前生效的那一路策略; 另一路照旧存在配置里, 只是不在这儿打扰用户
+    let ac = current_ac();
+    let policy_is_display = if ac { &cfg.policy_ac } else { &cfg.policy_dc } == "display";
+    let (label_display, label_system) = policy_items(ac);
 
     unsafe {
         let menu = CreatePopupMenu().expect("CreatePopupMenu");
         let check = |on: bool| if on { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
-        let mut title_w: Vec<u16> = menu_title().encode_utf16().collect();
-        title_w.push(0);
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+        // AppendMenuW 会把字符串拷进菜单, 所以这些缓冲只需活到调用返回
+        let [t_power, t_state, t_why] = menu_title_lines();
+        let power_w = wide(&t_power);
+        let state_w = wide(&t_state);
+        let why_w = wide(&t_why);
+        let display_w = wide(&label_display);
+        let system_w = wide(&label_system);
 
-        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE, PCWSTR(title_w.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE, PCWSTR(power_w.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE_STATE, PCWSTR(state_w.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE_WHY, PCWSTR(why_w.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let _ = AppendMenuW(menu, MF_STRING | check(mode == Mode::Auto), ID_AUTO, w!("自动 (按活动检测)"));
@@ -533,8 +583,8 @@ fn build_menu() -> HMENU {
         let _ = AppendMenuW(menu, MF_STRING | check(cfg.hint_enabled), ID_DET_HINT, w!("检测: 外部提示文件"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        let _ = AppendMenuW(menu, MF_STRING | check(cfg.policy_ac == "display"), ID_POLICY_AC, w!("插电时保持屏幕常亮"));
-        let _ = AppendMenuW(menu, MF_STRING | check(cfg.policy_dc == "display"), ID_POLICY_DC, w!("电池时保持屏幕常亮"));
+        let _ = AppendMenuW(menu, MF_STRING | check(policy_is_display), ID_POLICY_DISPLAY, PCWSTR(display_w.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING | check(!policy_is_display), ID_POLICY_SYSTEM, PCWSTR(system_w.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING | check(autostart_installed()), ID_AUTOSTART, w!("开机自启"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
@@ -587,6 +637,8 @@ fn sync_menu_state() {
     let mode = current_mode();
     let forced = matches!(mode, Mode::Force(_));
     let force_pick = FORCE_PICK.load(Ordering::SeqCst);
+    let ac = current_ac();
+    let policy_is_display = if ac { &cfg.policy_ac } else { &cfg.policy_dc } == "display";
 
     unsafe {
         let set = |id: usize, on: bool| {
@@ -603,20 +655,30 @@ fn sync_menu_state() {
         set(ID_DET_PROC, cfg.proc_enabled);
         set(ID_DET_DL, cfg.dl_enabled);
         set(ID_DET_HINT, cfg.hint_enabled);
-        set(ID_POLICY_AC, cfg.policy_ac == "display");
-        set(ID_POLICY_DC, cfg.policy_dc == "display");
+        set(ID_POLICY_DISPLAY, policy_is_display);
+        set(ID_POLICY_SYSTEM, !policy_is_display);
         set(ID_AUTOSTART, autostart_installed());
 
-        // 标题文字也可能变(模式、原因、倒计时)
-        let mut title: Vec<u16> = menu_title().encode_utf16().collect();
-        title.push(0);
-        let mii = MENUITEMINFOW {
-            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_STRING,
-            dwTypeData: PWSTR(title.as_mut_ptr()),
-            ..Default::default()
+        let set_text = |id: usize, s: &str| {
+            let mut w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+            let mii = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_STRING,
+                dwTypeData: PWSTR(w.as_mut_ptr()),
+                ..Default::default()
+            };
+            let _ = SetMenuItemInfoW(menu, id as u32, false, &mii);
         };
-        let _ = SetMenuItemInfoW(menu, ID_TITLE as u32, false, &mii);
+        // 顶部三行会变(供电、模式、原因、倒计时)
+        let [t_power, t_state, t_why] = menu_title_lines();
+        set_text(ID_TITLE, &t_power);
+        set_text(ID_TITLE_STATE, &t_state);
+        set_text(ID_TITLE_WHY, &t_why);
+        // 策略两项的标题里带着供电来源 —— 菜单开着期间插拔电源也要跟上,
+        // 否则勾变了而标题还写着另一路, 是最容易误读的组合
+        let (label_display, label_system) = policy_items(ac);
+        set_text(ID_POLICY_DISPLAY, &label_display);
+        set_text(ID_POLICY_SYSTEM, &label_system);
 
         // 菜单窗口句柄可能还没拿到(第一次点击前), 兜底再找一次
         let mut win = MENU_WINDOW.load(Ordering::SeqCst);
@@ -699,13 +761,13 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         return pass(());
     }
     let id = GetMenuItemID(menu, pos) as usize;
-    // 分隔条返回 0; 标题行是 disabled, 两者都当"什么也不做"处理并吞掉
+    // 分隔条返回 0; 顶部三行是 disabled, 两者都当"什么也不做"处理并吞掉
     if id != 0 && !keeps_menu_open(id) {
         return pass(()); // 需要关闭菜单的项走原生路径
     }
 
     // 按下时只吞掉, 抬起时才执行 —— 与菜单原本的行为一致
-    if msg == WM_LBUTTONUP && id != 0 && id != ID_TITLE {
+    if msg == WM_LBUTTONUP && id != 0 && !is_title(id) {
         let owner = HWND(MENU_OWNER.load(Ordering::SeqCst));
         handle_command(owner, id);
         sync_menu_state();
@@ -792,8 +854,8 @@ fn handle_command(hwnd: HWND, id: usize) {
         ID_DET_PROC => toggle("proc_enabled", cfg.proc_enabled),
         ID_DET_DL => toggle("dl_enabled", cfg.dl_enabled),
         ID_DET_HINT => toggle("hint_enabled", cfg.hint_enabled),
-        ID_POLICY_AC => toggle_policy("policy_ac", &cfg.policy_ac),
-        ID_POLICY_DC => toggle_policy("policy_dc", &cfg.policy_dc),
+        ID_POLICY_DISPLAY => set_active_policy("display"),
+        ID_POLICY_SYSTEM => set_active_policy("system"),
         ID_AUTOSTART => {
             // schtasks/reg 子进程要跑数百 ms 到数秒。这里可能在 WH_MOUSE 钩子里
             // (菜单打开期间), 同步执行会冻结整个线程的输入队列。
@@ -833,8 +895,14 @@ fn toggle(key: &str, current: bool) {
     save_setting(key, if current { "false" } else { "true" });
 }
 
-fn toggle_policy(key: &str, current: &str) {
-    save_setting(key, if current == "display" { "system" } else { "display" });
+/// 设置**当前生效的那一路**供电策略, 另一路不动。
+///
+/// 菜单只呈现生效中的一路(见 `policy_items`), 所以这里也只能改那一路 ——
+/// 插电时改 `policy_ac`, 电池时改 `policy_dc`。两路始终独立存储, 想同时看到
+/// 两个值就打开配置文件。
+fn set_active_policy(value: &str) {
+    let key = if current_ac() { "policy_ac" } else { "policy_dc" };
+    save_setting(key, value);
 }
 
 /// 写配置项并让 worker 重载。落盘失败要记日志 + 弹窗:
@@ -879,8 +947,9 @@ fn show_details(hwnd: HWND) {
                 if snap.display_on { "开" } else { "关" }
             ));
             lines.push(format!("持有: {}", snap.held.label()));
-            // 用 describe() 而不是 {:?}: Force 的 Debug 会把 Instant 的内部计数印出来
-            lines.push(format!("模式: {}", snap.describe()));
+            // describe_state() 而不是 describe(): 供电已经在上一行了。
+            // 也不能用 {:?} —— Force 的 Debug 会把 Instant 的内部计数印出来
+            lines.push(format!("模式: {}", snap.describe_state()));
             lines.push(format!(
                 "原因: {}",
                 if snap.reasons.is_empty() {
@@ -894,9 +963,15 @@ fn show_details(hwnd: HWND) {
     }
     lines.push(String::new());
     lines.push(format!("轮询 {}s   宽限 {}s", cfg.poll_interval_secs, cfg.grace_secs));
+    // 两路都列出来: 菜单里只呈现生效的那一路, 这里是唯一能一眼看全的地方
     lines.push(format!(
-        "策略  插电={}  电池={}  never_wake_display={}",
-        cfg.policy_ac, cfg.policy_dc, cfg.never_wake_display
+        "策略  插电={}  电池={}",
+        crate::engine::policy_label(&cfg.policy_ac),
+        crate::engine::policy_label(&cfg.policy_dc)
+    ));
+    lines.push(format!(
+        "屏幕已熄时不主动点亮 (never_wake_display): {}",
+        on(cfg.never_wake_display)
     ));
     lines.push(format!(
         "检测  音频{} 网络{} 进程{} 下载器{} 提示{}",
@@ -1167,6 +1242,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 供电策略两项的标题必须写明作用于哪一路。
+    ///
+    /// 这两项只改生效中的那一路(插电改 policy_ac, 电池改 policy_dc), 而两路独立存储。
+    /// 标题里不带来源的话, 插电下选了"阻止熄屏"、拔电再开菜单看到勾跑到"阻止睡眠",
+    /// 会以为设置丢了。
+    #[test]
+    fn policy_items_state_which_power_source_they_edit() {
+        let (d, s) = policy_items(true);
+        assert!(d.contains("插电") && s.contains("插电"), "得到 {:?} / {:?}", d, s);
+        assert!(d.contains("阻止熄屏"), "得到 {}", d);
+        assert!(s.contains("阻止睡眠"), "得到 {}", s);
+
+        let (d2, s2) = policy_items(false);
+        assert!(d2.contains("电池") && s2.contains("电池"), "得到 {:?} / {:?}", d2, s2);
+        assert!(!d2.contains("插电") && !s2.contains("插电"));
+
+        // 两项必须能区分, 且两种供电下的标题也必须不同
+        assert_ne!(d, s);
+        assert_ne!(d, d2);
+    }
+
+    /// 用词必须与 engine 那边一致 —— 状态行说"阻止熄屏", 菜单项也得这么说
+    #[test]
+    fn policy_items_match_engine_wording() {
+        let (d, s) = policy_items(true);
+        assert!(d.contains(crate::engine::policy_label("display")));
+        assert!(s.contains(crate::engine::policy_label("system")));
     }
 
     /// 用 `GetDIBits` 把 HICON 的颜色位图读回来, **自上而下**(与 paint_icon 同序)。
