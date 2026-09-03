@@ -4,5 +4,11 @@
 *.toml text eol=lf
 *.md   text eol=lf
 *.ini  text eol=lf
+# Inno 脚本: 行尾用 LF 没问题(实测编译通过), 但**必须保住 UTF-8 BOM** ——
+# Inno 6 靠 BOM 判断脚本编码, 丢了 BOM 里面的中文全变乱码, 且编译不报错。
+# working-tree-encoding 不能用: 那会让 git 把它当 UTF-8 以外的编码转换。
+# 这里只声明 text + eol=lf, BOM 作为文件内容的一部分本来就不会被 git 动。
+*.iss  text eol=lf
+*.ico  binary
 *.exe  binary
 *.pdb  binary

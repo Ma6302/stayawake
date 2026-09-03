@@ -1,1 +1,5 @@
 /target
+# 打包产物与生成的图标 —— 都由 cargo build + --write-ico + ISCC 重新生成,
+# 不入库。图标从代码生成(见 README 的"打安装包"), 提交它只会带来跟代码脱节的风险。
+/dist
+/installer/stayawake.ico

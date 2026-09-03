@@ -9,11 +9,27 @@
 Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在下载」「Agent 在跑任务」，
 于是这些场景下机器照样熄屏休眠。stayawake 补上这一层判断。
 
-- 单个原生 exe，**382 KB**，无运行时依赖
+- 单个原生 exe，**388 KB**，无运行时依赖
 - 实测常驻开销：**私有内存 2.4 MB，CPU 0.14%/单核**（20 核机器上约占总算力 0.007%）
 - 检测延迟 **2 秒**（廉价探测走快速通道，完整检测仍是 15 秒一轮）
 - 对游戏无影响：EcoQoS 丢到 E-core、BelowNormal 优先级、**绝不调 `timeBeginPeriod`**
-- 106 个单元测试
+- 117 个单元测试
+
+---
+
+## 安装
+
+从 [Releases](https://github.com/Ma6302/stayawake/releases) 下载
+`stayawake-<版本>-setup.exe`，双击即可。中文向导，默认装到
+`C:\Program Files\stayawake`，安装完成即注册开机自启。
+
+不想装的话下载同一个 Release 里的 `stayawake.exe` 直接跑 —— 它是个单文件，
+无运行时依赖，放哪都能用。
+
+```powershell
+# 卸载走「设置 → 应用」或安装目录里的 unins000.exe。
+# 配置与日志在 %LOCALAPPDATA%\stayawake\，卸载时会问一句要不要一起删。
+```
 
 ---
 
@@ -21,7 +37,7 @@ Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在
 
 ```powershell
 cargo build --release
-cargo test --release          # 106 个单元测试
+cargo test --release          # 117 个单元测试
 
 # 看一眼各检测器读数（不常驻，调阈值用）
 .\target\release\stayawake.exe --status
@@ -212,7 +228,7 @@ $h = [T.W]::FindWindowW("stayawake_msgwnd","stayawake")
 
 ## 已验证
 
-**106 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
+**117 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
 
 | 模块 | 测试重点 |
 |---|---|
@@ -223,9 +239,9 @@ $h = [T.W]::FindWindowW("stayawake_msgwnd","stayawake")
 | `detect::net` | probe/tick 基线独立、禁用时清基线、网卡过滤层去重 |
 | `engine` | 供电策略真值表、`Held` flags 必带 `ES_CONTINUOUS`、**过期 Force 折叠为 Auto** |
 | `log` | 轮转边界、**并发写行行完整**（100 行零丢失、无半行） |
-| `main` | Force 截止时刻夹取休眠时长（向上取整、过期不忙等） |
+| `main` | Force 截止时刻夹取休眠时长（向上取整、过期不忙等）、**生成的 .ico 必须能被 `LoadImageW` 在四个尺寸下加载**、PNG/zlib 校验和的已知答案、预乘反乘 |
 | `power` | `apply_hold` 返回值语义（首次调用即成功） |
-| `tray` | **画出的像素 alpha 必须非零**（否则托盘全透明）、预乘不变量、圆的几何、绿点在右上（钉住行序约定）、`CreateIconIndirect` 往返后 alpha 仍在 |
+| `tray` | **画出的像素 alpha 必须非零**（否则托盘全透明）、预乘不变量、圆的几何、绿点在右上（钉住行序约定）、`CreateIconIndirect` 往返后 alpha 仍在、三行状态块的切分 |
 | `autostart` | 计划任务 XML 的三个坑全部关闭、路径转义、UTF-16 BOM |
 
 真机验证（提权 `powercfg /requests` 是唯一真值来源）：
@@ -247,6 +263,10 @@ SYSTEM:
 - 配置告警：故意写坏四个键（`abc` / `enabled` / `0` / `NaN`）→ `--status` 与日志各报四条，重复重载不刷屏
 - 自启：计划任务 XML 三个默认坑已确认关闭；开关点击 **8 ms 返回**（异步化前会阻塞数百 ms）
 - 单实例、配置热重载、托盘开关回写、Explorer 重启后重加图标
+- 安装包：安装 / 卸载各跑两轮（含"守护进程正在运行"和"勾选桌面快捷方式"两种情形）。
+  逐项核对了安装目录内容、两处快捷方式的目标与图标、卸载注册项、计划任务的
+  **UserId SID 与当前用户一致**且三个默认坑仍是关闭的；卸载后目录 / 快捷方式 /
+  计划任务 / 注册项全部清空，而 `%LOCALAPPDATA%\stayawake\` 里的配置逐字节未变
 
 ---
 
@@ -413,7 +433,7 @@ hint_ttl_secs = 60
 
 ```powershell
 cargo build --release   # 产物: target\release\stayawake.exe
-cargo test --release    # 106 个单元测试
+cargo test --release    # 117 个单元测试
 cargo clippy --release --all-targets
 ```
 
@@ -428,6 +448,46 @@ cargo clippy --release --all-targets
 
 **摸 COM 的测试必须先调 `detect::com_test_guard()`**，原因见上面第 4 个坑。
 少调一处就会带回那个间歇性 `0xC0000005`，而且崩的位置每次都不一样。
+
+### 打安装包
+
+需要 [Inno Setup 6](https://jrsoftware.org/isdl.php)。三步：
+
+```powershell
+cargo build --release
+.\target\release\stayawake.exe --write-ico installer\stayawake.ico
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\stayawake.iss
+# 产物: dist\stayawake-0.1.0-setup.exe
+```
+
+图标是**从代码生成**的，不是手工维护的资源文件 —— `--write-ico` 复用 `tray.rs`
+里那个光栅化器，所以安装包图标和托盘图标不可能画得不一样。`.ico` 因此不入库
+（`.gitignore` 里排除了），每次打包重新生成。
+
+`stayawake.iss` 必须以 **UTF-8 with BOM** 保存。Inno 6 靠 BOM 判断脚本编码，
+没有 BOM 的话里面所有中文都会变成乱码 —— 编译不报错，但装出来的向导是花的。
+
+改版本号时 `Cargo.toml` 和 `stayawake.iss` 的 `AppVersion` 要一起改。
+`AppId` 那个 GUID **永远不要动**，它是升级识别的唯一依据，改了会变成并列装两份。
+
+<details>
+<summary>安装包里踩到的三点</summary>
+
+**停止运行中实例必须放在 `InitializeSetup`**，不能只放 `PrepareToInstall`。
+实测顺序是 `InitializeSetup` → AppMutex 检查 → 向导 → `PrepareToInstall`，
+所以放在后者时 AppMutex 早就先弹出"请关闭它的所有实例"并中止了安装
+（静默安装表现为退出码 1，日志里是 `Got EAbort exception`）。
+
+**`CloseApplications` 对单 exe 程序不起作用**。实测 RestartManager 的 `RmGetList`
+报 `found no applications using one of our files`，即便守护进程正从目标路径运行。
+真正起作用的是自己给隐藏消息窗口发 `WM_CLOSE` —— 顺带还能走完
+`WM_DESTROY` 里摘托盘图标、释放 execution state、写 `stopped` 日志那一串，
+比 `taskkill` 干净（直接杀会留一个托盘幽灵图标）。
+
+**卸载脚本里的对话框必须用 `SuppressibleMsgBox`**。普通 `MsgBox` 在
+`/VERYSILENT` 下照样弹出并无限期阻塞，脚本化卸载会直接挂住。
+
+</details>
 
 ---
 

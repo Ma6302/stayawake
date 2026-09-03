@@ -52,10 +52,25 @@ impl Shared {
 }
 
 fn main() {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
         Some("--status") => print_status(),
         Some("--install-autostart") => println!("{}", autostart::install()),
         Some("--uninstall-autostart") => println!("{}", autostart::uninstall()),
+        Some("--write-ico") => match args.get(2) {
+            Some(path) => match write_ico(std::path::Path::new(path)) {
+                Ok(n) => println!("wrote {} ({} bytes)", path, n),
+                Err(e) => {
+                    eprintln!("写入失败: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("--write-ico 需要输出路径\n");
+                print!("{}", HELP);
+                std::process::exit(2);
+            }
+        },
         Some("--help" | "-h") => print!("{}", HELP),
         Some(other) => {
             eprintln!("未知参数: {}\n", other);
@@ -72,12 +87,156 @@ const HELP: &str = r#"stayawake - 基于真实活动检测的休眠抑制守护�
   stayawake --status              打印一轮全部检测器读数后退出
   stayawake --install-autostart   注册开机自启(登录触发的计划任务)
   stayawake --uninstall-autostart 移除开机自启
+  stayawake --write-ico <路径>    导出产品图标为 .ico (打安装包用)
 
 路径:
   配置  %LOCALAPPDATA%\stayawake\config.ini   (首次运行自动生成)
   日志  %LOCALAPPDATA%\stayawake\stayawake.log (仅记录状态跃变)
   提示  %LOCALAPPDATA%\stayawake\hints\*.hint  (touch 即保持唤醒, 删除即释放)
 "#;
+
+/// 把产品图标写成多尺寸 .ico。给安装包和快捷方式用。
+///
+/// 复用托盘的光栅化器, 所以图标不会与托盘里显示的那个长得不一样 ——
+/// 手工维护一个 .ico 文件迟早会跟代码里的画法脱节。
+///
+/// 每一帧都存成 PNG(Vista 起 .ico 支持 PNG 帧)。用 BMP 帧的话要自己拼
+/// BITMAPINFOHEADER + AND 掩码, 而 PNG 帧只需把像素喂给编码器。
+fn write_ico(path: &std::path::Path) -> std::io::Result<u64> {
+    // 覆盖实际会被用到的档位: 16(列表/托盘) 32(桌面/快捷方式) 48(图标视图)
+    // 64(200% DPI 下的 32 槽位)。
+    //
+    // **故意不含 256**: 下面的 PNG 编码器不压缩, 一帧 256x256 就是 256 KB,
+    // 而这个图标是个纯色圆 —— 256 档只在资源管理器"超大图标"下才用得到,
+    // 不值得让安装包胖 256 KB。真要加就得先实现 deflate。
+    const SIZES: [usize; 4] = [16, 32, 48, 64];
+
+    let mut frames: Vec<(usize, Vec<u8>)> = Vec::new();
+    for size in SIZES {
+        let px = tray::product_icon_pixels(size);
+        frames.push((size, encode_png_rgba(size, &px)));
+    }
+
+    let mut out: Vec<u8> = Vec::new();
+    // ICONDIR: reserved=0, type=1(icon), count
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&(frames.len() as u16).to_le_bytes());
+
+    // ICONDIRENTRY 各 16 字节, 数据紧随其后
+    let mut offset = 6 + 16 * frames.len();
+    for (size, data) in &frames {
+        // 256 在这个字段里必须写 0 —— 它只有一个字节
+        out.push(if *size >= 256 { 0 } else { *size as u8 });
+        out.push(if *size >= 256 { 0 } else { *size as u8 });
+        out.push(0); // 调色板数
+        out.push(0); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // 色彩平面
+        out.extend_from_slice(&32u16.to_le_bytes()); // 位深
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        offset += data.len();
+    }
+    for (_, data) in &frames {
+        out.extend_from_slice(data);
+    }
+
+    std::fs::write(path, &out)?;
+    Ok(out.len() as u64)
+}
+
+/// 最小 PNG 编码器: 8 位 RGBA、无过滤、**不压缩**(deflate 的 stored 块)。
+///
+/// 图标只有几百到几万像素, 不值得引入 flate2 —— 256x256 未压缩也就 256 KB,
+/// 而 .ico 只在打包时生成一次。stored 块是合法 deflate, 任何解码器都认。
+///
+/// 输入是**预乘 alpha** 的 BGRA(光栅化器的输出), PNG 要求非预乘 RGBA, 所以要反乘。
+fn encode_png_rgba(size: usize, px: &[u32]) -> Vec<u8> {
+    // ── 原始扫描线: 每行前面一个过滤器字节(0 = None) ──
+    let mut raw = Vec::with_capacity(size * (1 + size * 4));
+    for y in 0..size {
+        raw.push(0);
+        for x in 0..size {
+            let p = px[y * size + x];
+            let a = (p >> 24) as u8;
+            // 预乘 -> 直通。a=0 时整个像素不可见, 颜色取 0 即可
+            let un = |c: u32| -> u8 {
+                if a == 0 {
+                    0
+                } else {
+                    ((c * 255 + a as u32 / 2) / a as u32).min(255) as u8
+                }
+            };
+            raw.push(un((p >> 16) & 0xFF)); // R
+            raw.push(un((p >> 8) & 0xFF)); // G
+            raw.push(un(p & 0xFF)); // B
+            raw.push(a);
+        }
+    }
+
+    let mut png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(size as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(size as u32).to_be_bytes());
+    ihdr.push(8); // 位深
+    ihdr.push(6); // 颜色类型 6 = RGBA
+    ihdr.extend_from_slice(&[0, 0, 0]); // 压缩/过滤/隔行 都用标准值
+    png_chunk(&mut png, b"IHDR", &ihdr);
+
+    png_chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+    png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(4 + data.len());
+    crc_input.extend_from_slice(kind);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+/// zlib 容器 + 全部用 deflate 的 stored(未压缩)块。
+/// 每块最多 0xFFFF 字节, LEN 与 ~LEN 都是小端。
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01]; // CMF/FLG: deflate, 32K 窗口, 最快
+    let mut chunks = data.chunks(0xFFFF).peekable();
+    if data.is_empty() {
+        out.extend_from_slice(&[1, 0, 0, 0xFF, 0xFF]);
+    }
+    while let Some(c) = chunks.next() {
+        out.push(u8::from(chunks.peek().is_none())); // BFINAL
+        out.extend_from_slice(&(c.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(c.len() as u16)).to_le_bytes());
+        out.extend_from_slice(c);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            // 0xEDB88320 = 反射的 PNG/zlib 多项式
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (!(crc & 1)).wrapping_add(1));
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in data {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
 
 // ───────────────────────────── 守护进程 ─────────────────────────────
 
@@ -516,5 +675,109 @@ mod tests {
         assert_eq!(clamp_to_force_deadline(15, Mode::Force(now), now), 1);
         let past = now - Duration::from_secs(10);
         assert_eq!(clamp_to_force_deadline(15, Mode::Force(past), now), 1);
+    }
+
+    // ───────────────────────── .ico 导出 ─────────────────────────
+
+    /// 生成的 .ico 必须能被 **Windows 自己** 解析出全部四个尺寸。
+    ///
+    /// 光靠"文件写出来了"什么都证明不了 —— ICONDIRENTRY 的宽高字段只有一个字节、
+    /// 偏移要跨过整个目录区、PNG 帧要有正确的 CRC 和 zlib 校验和, 任何一处写错
+    /// 都是能落盘但加载不了的文件。所以这里走 `LoadImageW` 让系统真的读一遍。
+    #[test]
+    fn written_ico_loads_at_every_size() {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DestroyIcon, LoadImageW, HICON, IMAGE_ICON, LR_LOADFROMFILE,
+        };
+
+        let path = std::env::temp_dir().join("stayawake_icon_test.ico");
+        let n = write_ico(&path).expect("应能写出 .ico");
+        assert!(n > 1000, "文件只有 {} 字节, 不可能含四个尺寸", n);
+
+        let wide: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        for size in [16, 32, 48, 64] {
+            let h = unsafe {
+                LoadImageW(
+                    None,
+                    PCWSTR(wide.as_ptr()),
+                    IMAGE_ICON,
+                    size,
+                    size,
+                    LR_LOADFROMFILE,
+                )
+            };
+            let h = h.unwrap_or_else(|e| panic!("{}px 加载失败: {:?}", size, e));
+            assert!(!h.is_invalid(), "{}px 得到空句柄", size);
+            unsafe {
+                let _ = DestroyIcon(HICON(h.0));
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// zlib 流的两个校验必须对: adler32 是 zlib 尾, crc32 是每个 PNG 块尾。
+    /// 用已知答案钉住 —— 自己实现的校验和写错了很难从"图标看起来正常"里发现。
+    #[test]
+    fn checksums_match_known_values() {
+        // RFC 1950 附录里的经典例子
+        assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
+        assert_eq!(adler32(b""), 1);
+        // PNG 规范: "IEND" 块(空数据)的 CRC
+        assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// stored 块的头必须是 `BFINAL LEN ~LEN`, 且 LEN 与 ~LEN 互补 ——
+    /// 写错的话解码器会直接报 "invalid stored block lengths"。
+    #[test]
+    fn stored_deflate_blocks_are_well_formed() {
+        let data = vec![0xABu8; 0x1_0000 + 5]; // 跨两个块
+        let z = zlib_stored(&data);
+        assert_eq!(&z[..2], &[0x78, 0x01], "zlib 头");
+
+        // 第一块: 未结束, 满 0xFFFF
+        assert_eq!(z[2], 0, "第一块不该是 BFINAL");
+        let len1 = u16::from_le_bytes([z[3], z[4]]);
+        let nlen1 = u16::from_le_bytes([z[5], z[6]]);
+        assert_eq!(len1, 0xFFFF);
+        assert_eq!(nlen1, !len1);
+
+        // 第二块紧随其后
+        let p = 7 + 0xFFFF;
+        assert_eq!(z[p], 1, "最后一块必须是 BFINAL");
+        let len2 = u16::from_le_bytes([z[p + 1], z[p + 2]]);
+        assert_eq!(len2, 6);
+        assert_eq!(u16::from_le_bytes([z[p + 3], z[p + 4]]), !len2);
+
+        // 尾部四字节是大端 adler32
+        let tail = &z[z.len() - 4..];
+        assert_eq!(u32::from_be_bytes(tail.try_into().unwrap()), adler32(&data));
+    }
+
+    /// 预乘 -> 直通的反乘必须还原出原色。
+    /// 忘了反乘的话半透明边缘会偏暗, 而完全不透明的部分看起来照常正常。
+    #[test]
+    fn png_encoding_unpremultiplies_alpha() {
+        // 单像素: 半透明的纯红。预乘后 R = 255 * 128 / 255 = 128
+        let px = vec![(128u32 << 24) | (128 << 16)];
+        let png = encode_png_rgba(1, &px);
+        // 8 字节签名 + IHDR(4+4+13+4) + IDAT 头(4+4)
+        let idat = 8 + 25 + 8;
+        // zlib 头 2 + stored 头 5 -> 原始扫描线: 过滤器字节 + RGBA
+        let raw = &png[idat + 7..idat + 7 + 5];
+        assert_eq!(raw[0], 0, "过滤器应为 None");
+        assert_eq!(raw[1], 255, "R 应还原为 255, 得到 {}", raw[1]);
+        assert_eq!((raw[2], raw[3]), (0, 0));
+        assert_eq!(raw[4], 128, "alpha 原样保留");
+
+        // alpha=0 的像素颜色取 0, 不能除零
+        let clear = encode_png_rgba(1, &[0]);
+        let raw0 = &clear[idat + 7..idat + 7 + 5];
+        assert_eq!(&raw0[1..], &[0, 0, 0, 0]);
     }
 }

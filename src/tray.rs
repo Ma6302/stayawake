@@ -298,6 +298,13 @@ const ICON_SIZE: usize = 32;
 /// 每像素每轴的超采样数, 用于抗锯齿。4x4=16 个样本足够让 32→16 降采样后边缘干净。
 const ICON_AA: u32 = 4;
 
+/// 产品图标(蓝色实心圆, 不带角标)的像素, 供 `--write-ico` 生成 .ico 用。
+///
+/// 与托盘图标共用同一个光栅化器, 所以两者不可能画得不一样。
+pub fn product_icon_pixels(size: usize) -> Vec<u32> {
+    paint_icon_at(Look::SystemDisplay, size)
+}
+
 /// (r, g, b)。**故意不用 COLORREF 的 `0x00bbggrr` 排布** —— 那种写法下
 /// `0x0000B3FF` 到底是琥珀还是天蓝, 只能靠数字节数, 读代码的人必然会读错。
 type Rgb = (u8, u8, u8);
@@ -327,36 +334,50 @@ fn palette(look: Look) -> Rgb {
 /// 并不一致 —— 这正是"双击一下能看见、过一会儿又变空白"的来源。既然不能依赖它,
 /// 就必须自己把 alpha 写对。
 fn paint_icon(look: Look) -> Vec<u32> {
-    let mut px = vec![0u32; ICON_SIZE * ICON_SIZE];
-    let c = ICON_SIZE as f32 / 2.0;
+    paint_icon_at(look, ICON_SIZE)
+}
+
+/// `paint_icon` 的任意边长版本。几何按 32px 设计, 其余尺寸整体缩放 ——
+/// .ico 需要多种尺寸, 而让 shell 从一张 32px 图降采样到 16px 会糊。
+fn paint_icon_at(look: Look, size: usize) -> Vec<u32> {
+    let mut px = vec![0u32; size * size];
+    let k = size as f32 / 32.0;
+    let c = size as f32 / 2.0;
 
     // 主体圆: 与旧版 Ellipse(6,6)-(26,26) 同几何 —— 圆心 (16,16), 半径 10
-    fill_disc(&mut px, (c, c), 10.0, palette(look));
+    fill_disc(&mut px, size, (c, c), 10.0 * k, palette(look));
 
     match look {
         // 绿点在右上: 旧版 Ellipse(20,6)-(28,14) —— 圆心 (24,10), 半径 4
-        Look::Force => fill_disc(&mut px, (24.0, 10.0), 4.0, (0, 224, 0)),
+        Look::Force => fill_disc(&mut px, size, (24.0 * k, 10.0 * k), 4.0 * k, (0, 224, 0)),
         // 白色斜杠: 旧版 (7,25)->(25,7), 线宽 4
-        Look::Paused => stroke_line(&mut px, (7.0, 25.0), (25.0, 7.0), 4.0, (255, 255, 255)),
+        Look::Paused => stroke_line(
+            &mut px,
+            size,
+            (7.0 * k, 25.0 * k),
+            (25.0 * k, 7.0 * k),
+            4.0 * k,
+            (255, 255, 255),
+        ),
         _ => {}
     }
     px
 }
 
-fn fill_disc(px: &mut [u32], (cx, cy): (f32, f32), radius: f32, color: Rgb) {
+fn fill_disc(px: &mut [u32], size: usize, (cx, cy): (f32, f32), radius: f32, color: Rgb) {
     let rr = radius * radius;
-    composite(px, color, |x, y| {
+    composite(px, size, color, |x, y| {
         let (dx, dy) = (x - cx, y - cy);
         dx * dx + dy * dy <= rr
     });
 }
 
 /// 圆头线段: 判据是"到线段的距离 ≤ 半宽"
-fn stroke_line(px: &mut [u32], a: (f32, f32), b: (f32, f32), width: f32, color: Rgb) {
+fn stroke_line(px: &mut [u32], size: usize, a: (f32, f32), b: (f32, f32), width: f32, color: Rgb) {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len2 = dx * dx + dy * dy;
     let half2 = (width / 2.0) * (width / 2.0);
-    composite(px, color, |x, y| {
+    composite(px, size, color, |x, y| {
         // 投影到线段并夹到 [0,1], 得到线段上最近的点
         let t = (((x - a.0) * dx + (y - a.1) * dy) / len2).clamp(0.0, 1.0);
         let (ex, ey) = (x - (a.0 + t * dx), y - (a.1 + t * dy));
@@ -367,11 +388,11 @@ fn stroke_line(px: &mut [u32], a: (f32, f32), b: (f32, f32), width: f32, color: 
 /// 超采样求每个像素的覆盖率, 按 source-over 合成上去。
 ///
 /// 覆盖率直接当 alpha 用, 所以边缘是半透明而不是锯齿 —— 32→16 降采样后差别明显。
-fn composite<F: Fn(f32, f32) -> bool>(px: &mut [u32], color: Rgb, inside: F) {
+fn composite<F: Fn(f32, f32) -> bool>(px: &mut [u32], size: usize, color: Rgb, inside: F) {
     let step = 1.0 / ICON_AA as f32;
     let total = ICON_AA * ICON_AA;
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
+    for y in 0..size {
+        for x in 0..size {
             let mut hits = 0u32;
             for sy in 0..ICON_AA {
                 for sx in 0..ICON_AA {
@@ -387,7 +408,7 @@ fn composite<F: Fn(f32, f32) -> bool>(px: &mut [u32], color: Rgb, inside: F) {
                 continue;
             }
             let a = (hits * 255 / total) as u8;
-            let i = y * ICON_SIZE + x;
+            let i = y * size + x;
             px[i] = over(premultiply(color, a), px[i]);
         }
     }
