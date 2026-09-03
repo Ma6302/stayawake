@@ -9,9 +9,11 @@
 Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在下载」「Agent 在跑任务」，
 于是这些场景下机器照样熄屏休眠。stayawake 补上这一层判断。
 
-- 单个原生 exe，**373 KB**，无运行时依赖
-- 实测常驻开销：**私有内存 2.0 MB，平均 CPU 0.17%/单核**（20 核机器上约占总算力 0.008%）
+- 单个原生 exe，**380 KB**，无运行时依赖
+- 实测常驻开销：**私有内存 1.6 MB，CPU 0.12–0.18%/单核**（20 核机器上约占总算力 0.008%）
+- 检测延迟 **2 秒**（廉价探测走快速通道，完整检测仍是 15 秒一轮）
 - 对游戏无影响：EcoQoS 丢到 E-core、BelowNormal 优先级、**绝不调 `timeBeginPeriod`**
+- 70 个单元测试
 
 ---
 
@@ -35,15 +37,60 @@ cargo test --release          # 70 个单元测试
 
 ---
 
+## 代码结构
+
+```
+src/main.rs        入口、单实例、EcoQoS、worker 循环（含快速通道）、--status
+src/engine.rs      决策核心：聚合检测 → 迟滞 → 供电策略 → execution state
+src/power.rs       SetThreadExecutionState / AC-DC / 主动睡眠 / 本地时间
+src/config.rs      配置解析、旧版自动补齐新键、原子回写（保留注释）
+src/log.rs         状态跃变日志，1 MB 轮转
+src/tray.rs        托盘图标（GDI 运行时绘制）、菜单、显示器状态通知
+src/autostart.rs   登录触发的计划任务 XML，失败回退注册表 Run
+src/detect/mod.rs  Detector trait、ProcessTable 快照、CpuTracker、RateMeter
+src/detect/{audio,net,proc,dl,hint}.rs   五个检测器
+plugins/stayawake-hint.js                OpenCode 插件
+```
+
+**两个线程，都是阻塞等待，空闲时零 CPU：**
+
+- **worker**（`main.rs`）—— 唯一持有 execution state 的线程。
+  `SetThreadExecutionState` 是**线程级**的，持有者线程退出即释放，所以它必须常驻并独占调用。
+- **UI**（`tray.rs`）—— 消息泵。托盘图标、菜单、`GUID_CONSOLE_DISPLAY_STATE` 通知
+  （维护"显示器是否点亮"，供 `never_wake_display` 用）、`TaskbarCreated` 广播。
+
+两者通过 `Shared`（`main.rs`）通信：`mode` / `snapshot` 两把锁 + `display_on` / `reload`
+两个原子量 + `kick` 事件（UI 踢醒 worker）。
+
+**Detector trait** 有两个方法：`tick()` 是完整检测（需要进程快照），
+`probe()` 是廉价探测（不打快照，只有 audio / net / hint 参与）。
+详见下面的"快速通道"。
+
+---
+
+## 快速通道
+
+完整检测每轮约 20 ms，其中 **11 ms 是 `ProcessTable::snapshot()`**（Toolhelp 快照 ~280 个进程）。
+所以不能简单把 `poll_interval` 调小 —— 实测调到 1 秒 CPU 会涨到 1.9%。
+
+做法：空闲时每 `fast_poll_secs`（默认 2 秒）只跑 `probe()` —— 读设备级音频峰值、
+网卡字节数、hint 目录，**不打进程快照**。探到疑似活动才做完整检测。
+
+- probe ≈ 4 ms，2 秒一次 = **0.2%** 单核；对比 `poll_interval=1` 的 1.9%，差近 10 倍
+- probe 允许假阳性（完整检测会否掉），**不允许假阴性**
+- 已持有请求时不启用：那时关心的是"活动何时结束"，由宽限期兜着
+
+---
+
 ## 检测器
 
-| 检测器 | 判据 | 说明 |
-|---|---|---|
-| **音频** | WASAPI 逐会话：`state==Active` 且 20s 内响过 | 枚举全部输出端点（扬声器/蓝牙/HDMI/USB 都算）。峰值保持窗口避免乐曲安静段落造成状态抖动 |
-| **网络** | `GetIfTable2` 全网卡字节差分 ≥ 1 MB/s，连续 2 tick | 15s 窗口天然滤掉遥测突发 |
-| **进程 CPU** | 白名单进程单核占用 ≥ 5% | 只针对 cargo/rustc/ffmpeg 这类「高 CPU = 真在干活」的工具 |
-| **下载器** | 进程 I/O ≥ 50 KB/s，**或**（established TCP ≥ 4 且 I/O ≥ 5 KB/s） | 专治 IDM（实测 CPU 恒为 0，靠 CPU 判不出来） |
-| **提示文件** | `hints\*.hint` 的 mtime 在 TTL 内 | 给任何程序留的精确通道 |
+| 检测器 | 判据 | 参与 probe | 说明 |
+|---|---|---|---|
+| **音频** | WASAPI 逐会话：`state==Active` 且 20s 内响过 | ✓ | 枚举全部输出端点（扬声器/蓝牙/HDMI/USB 都算）。峰值保持窗口避免乐曲安静段落造成状态抖动 |
+| **网络** | `GetIfTable2` 全网卡字节差分 ≥ 1 MB/s，连续 2 tick | ✓ | 排除 LWF/QoS 过滤层条目，否则一张网卡出现多次、速率虚高数倍 |
+| **进程 CPU** | 白名单进程单核占用 ≥ 5% | ✗ | 只针对 cargo/rustc/ffmpeg 这类「高 CPU = 真在干活」的工具 |
+| **下载器** | 进程 I/O ≥ 50 KB/s，**或**（established TCP ≥ 4 且 I/O ≥ 5 KB/s） | ✗ | 专治 IDM（实测 CPU 恒为 0，靠 CPU 判不出来） |
+| **提示文件** | `hints\*.hint` 的 mtime 在 TTL 内 | ✓ | 给任何程序留的精确通道 |
 
 任一命中即视为"忙"。
 
@@ -198,6 +245,55 @@ SYSTEM:
 - `ES_DISPLAY_REQUIRED` 按文档**不阻止屏保**。
 - 网络检测是全机聚合，不区分进程；VPN / 局域网流量同样计入。
 - 一旦已进入 Modern Standby，桌面应用被 DAM 挂起，我们也跑不动 —— 所以整个设计是**提前阻止进入**。
+- **hint 插件只在 OpenCode 启动时加载一次**。改动插件后必须重启 OpenCode。
+
+## 悬而未决
+
+这些是明确知道但还没做的，不是遗漏：
+
+**1. 释放请求后 Windows 是否重新计时（未实测）**
+
+微软文档里两处说法有张力。`SetThreadExecutionState` 说 `ES_SYSTEM_REQUIRED`
+是「重置系统空闲计时器」，听起来释放后要重新数满一个超时周期。而 Modern Standby
+文档描述 No-CS 阶段是「等待睡眠超时到期 **或** 等待电源请求到期」，听起来是两个
+独立条件，超时早已满足的话清除请求后应当很快入睡。
+
+带 `ES_CONTINUOUS` 的粘性状态在实现上就是一个 power request，与不带它的「戳一下
+计时器」语义不同。我倾向释放后会较快入睡，**但没在这台 Insider 26340 上实测过，
+不当成事实**。
+
+确定的是：不管哪种，都是有界的，最坏多等一个超时周期（AC 5 分钟 / DC 3 分钟）。
+
+测法：临时把熄屏/睡眠改成 1 分钟 → 放音乐让程序持有 → 静置 15 分钟 → 停掉音乐并
+记录时刻 → 观察实际入睡时刻 → `powercfg /sleepstudy` 交叉验证会话起始时间。
+测出「≈0s」还是「≈60s」就有确切答案了。
+
+**2. audio probe 无法应用忽略名单（影响未确认）**
+
+probe 读的是设备级混合峰值，拿不到 PID，所以忽略名单在快速通道里不生效。
+理论后果：若只有 Wallpaper Engine 在出声，probe 每 2 秒返回真 → 每 2 秒做一次
+完整检测（Toolhelp 快照 + WASAPI 枚举 + TCP 表），约 7.5× 预期开销。
+
+**但实测未观察到**：CPU 0.117%，与「每 15s 完整检测」的 0.13% 吻合，远低于放大
+情形的 1.0%；WE 的会话峰值读数是 0.000。要确认需要在无 hold 状态下静置观察，
+所以先不为它引入抑制逻辑。
+
+**3. 事件驱动的音频检测（有意不做）**
+
+`IAudioSessionNotification::OnSessionCreated` + `IAudioSessionEvents::OnStateChanged`
+能做到毫秒级零延迟。没用的原因：需要 `windows` crate 的 `implement` feature 实现
+COM 回调接口（当前依赖之外），回调在 MTA 线程池上执行要处理跨线程同步和生命周期。
+
+而收益很小 —— 熄屏最快也要 180 秒才触发，2 秒延迟离这个阈值差 90 倍。真正的风险
+是「完全漏检」而不是「晚 2 秒发现」。若想让托盘更跟手，把 `fast_poll_secs` 调到 1
+即可；再往下才值得上事件驱动。
+
+**4. 未做的健壮性改进**
+
+- `log.rs` 的轮转只有进程内互斥，第二个实例并发写会失败并被 `let _ =` 吞掉
+- `set_and_save` 基于一个更早读入的 `Config` 快照，中途的外部修改会被覆盖
+- `Snapshot::describe()` 在 `Force` 刚过期那一轮会显示「剩余 0 分 0 秒」（≤1 个周期的显示滞后）
+- 配置项的非法值静默回落到默认值，不记日志
 
 ### 本机（Win11 Insider 26340）踩到的三个坑
 
@@ -271,9 +367,18 @@ hint_ttl_secs = 60
 
 ```powershell
 cargo build --release   # 产物: target\release\stayawake.exe
+cargo test --release    # 70 个单元测试
+cargo clippy --release --all-targets
 ```
 
 仅支持 Windows（依赖 Win32 API：WASAPI、IP Helper、Power Management）。
+`windows` crate 钉在 0.52 —— 该版本的模块布局与 feature 名与新版有差异，
+升级前先用 [feature 搜索页](https://microsoft.github.io/windows-rs/features/) 逐个核对。
+
+**注意有副作用的测试**：`power::tests::apply_hold_*` 会真的调用
+`SetThreadExecutionState`（线程级，测试进程退出即释放），
+`autostart::tests::is_installed_*` 会真的跑 `schtasks` / `reg` 查询。
+都是只读或自我恢复的，但如果不想让它们跑，标 `#[ignore]`。
 
 ---
 
