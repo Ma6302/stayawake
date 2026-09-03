@@ -142,9 +142,18 @@ fn shared() -> &'static Arc<Shared> {
     SHARED.get().expect("SHARED not initialized")
 }
 
+/// 读当前模式, 已过期的 `Force` 折叠为 `Auto`。
+///
+/// 不回写(归一化的落盘由 worker 负责), 这里只保证**显示与判定一致**:
+/// 倒计时走完后 worker 可能还要最多一个 poll_interval 才醒, 期间直接读锁里的值
+/// 会让菜单仍勾着"强制常亮"、标题显示"剩余 0 分 0 秒", 而实际判定早已按 Auto 走。
+fn current_mode() -> Mode {
+    shared().mode.lock().unwrap().effective()
+}
+
 // ───────────────────────────── 托盘图标 ─────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Look {
     Idle,          // 灰
     System,        // 琥珀: 仅防睡
@@ -156,7 +165,7 @@ enum Look {
 fn current_look() -> Look {
     let s = shared();
     // 两个锁分开取, 不嵌套 —— 避免建立隐式锁序(match 的临时值会活到整个 match 结束)
-    let mode = *s.mode.lock().unwrap();
+    let mode = current_mode();
     match mode {
         Mode::Paused => Look::Paused,
         Mode::Force(_) => Look::Force,
@@ -171,9 +180,21 @@ fn current_look() -> Look {
     }
 }
 
+/// 取快照并把 mode 校正为**实时**值(worker 的快照总比这里晚一点, 且倒计时可能已走完)。
+/// 托盘上所有展示都必须经过这里, 否则会出现"点了没反应"或"剩余 0 分 0 秒"。
+fn live_snapshot() -> Option<crate::engine::Snapshot> {
+    let mode = current_mode();
+    let mut snap = shared().snapshot.lock().unwrap().clone()?;
+    snap.mode = mode;
+    // Force 已折叠成 Auto 时倒计时也要清掉, 否则 describe() 仍会拿旧值显示倒计时
+    if !matches!(mode, Mode::Force(_)) {
+        snap.force_left = None;
+    }
+    Some(snap)
+}
+
 fn current_tip() -> String {
-    let s = shared();
-    let desc = match s.snapshot.lock().unwrap().as_ref() {
+    let desc = match live_snapshot() {
         Some(snap) => snap.describe(),
         None => "启动中...".to_string(),
     };
@@ -378,20 +399,15 @@ fn autostart_installed() -> bool {
 /// 顶部状态行。用**实时** mode 而非快照里的, 这样点完立刻能看到变化
 /// (worker 虽然会被立即踢醒, 但快照更新总比这里晚一点)
 fn menu_title() -> String {
-    let s = shared();
-    let mode = *s.mode.lock().unwrap();
-    match s.snapshot.lock().unwrap().clone() {
-        Some(mut snap) => {
-            snap.mode = mode;
-            snap.describe()
-        }
+    match live_snapshot() {
+        Some(snap) => snap.describe(),
         None => "启动中...".to_string(),
     }
 }
 
 fn build_menu() -> HMENU {
     let cfg = Config::load_or_create();
-    let mode = *shared().mode.lock().unwrap();
+    let mode = current_mode();
     let forced = matches!(mode, Mode::Force(_));
     let force_pick = FORCE_PICK.load(Ordering::SeqCst);
 
@@ -470,7 +486,7 @@ fn sync_menu_state() {
     }
     let menu = HMENU(handle);
     let cfg = Config::load_or_create();
-    let mode = *shared().mode.lock().unwrap();
+    let mode = current_mode();
     let forced = matches!(mode, Mode::Force(_));
     let force_pick = FORCE_PICK.load(Ordering::SeqCst);
 
@@ -753,9 +769,8 @@ fn request_reload() {
 }
 
 fn show_details(hwnd: HWND) {
-    let s = shared();
     let cfg = Config::load_or_create();
-    let snap = s.snapshot.lock().unwrap().clone();
+    let snap = live_snapshot();
 
     let mut lines = vec!["stayawake 当前状态".to_string(), String::new()];
     match snap {
@@ -766,7 +781,8 @@ fn show_details(hwnd: HWND) {
                 if snap.display_on { "开" } else { "关" }
             ));
             lines.push(format!("持有: {}", snap.held.label()));
-            lines.push(format!("模式: {:?}", snap.mode));
+            // 用 describe() 而不是 {:?}: Force 的 Debug 会把 Instant 的内部计数印出来
+            lines.push(format!("模式: {}", snap.describe()));
             lines.push(format!(
                 "原因: {}",
                 if snap.reasons.is_empty() {
@@ -818,7 +834,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             match lp.0 as u32 {
                 // 左键单击: 自动 <-> 暂停 快速切换
                 WM_LBUTTONUP => {
-                    let cur = *shared().mode.lock().unwrap();
+                    let cur = current_mode();
                     set_mode(if cur == Mode::Auto { Mode::Paused } else { Mode::Auto });
                     refresh_icon(hwnd);
                 }

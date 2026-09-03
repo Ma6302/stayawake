@@ -16,6 +16,24 @@ pub enum Mode {
     Force(Instant),
 }
 
+impl Mode {
+    /// 把已过期的 `Force` 折叠成 `Auto`。
+    ///
+    /// 过期的 Force 在任何地方都必须表现得跟 Auto 一样, 否则会出现
+    /// "强制常亮 · 剩余 0 分 0 秒"这种自相矛盾的显示: 判定已按 Auto 走,
+    /// 而托盘还在报 Force。所有读 mode 的地方都应经过这里。
+    pub fn effective(self) -> Mode {
+        self.effective_at(Instant::now())
+    }
+
+    fn effective_at(self, now: Instant) -> Mode {
+        match self {
+            Mode::Force(until) if now >= until => Mode::Auto,
+            other => other,
+        }
+    }
+}
+
 /// 一轮决策的完整结果, 供托盘/日志/--status 共用
 #[derive(Clone)]
 pub struct Snapshot {
@@ -130,6 +148,10 @@ impl Engine {
         let table = ProcessTable::snapshot();
         let reasons = self.detect(cfg, &table);
         let now = Instant::now();
+        // 过期的 Force 一律按 Auto 处理, 快照里也记 Auto。否则会出现"判定已按 Auto 走、
+        // 托盘却显示强制常亮剩余 0 分 0 秒"。用 `now`(快照之后)判定, 与下面的
+        // desired / force_left 同一个时刻 —— 进程快照要 ~11ms, 拿调用前的时刻会留下同样的缝。
+        let mode = mode.effective_at(now);
 
         if !reasons.is_empty() {
             self.last_active = Some(now);
@@ -144,8 +166,9 @@ impl Engine {
         let ac = power::power_source() != PowerSource::Dc;
         let desired = match mode {
             Mode::Paused => Held::None,
-            Mode::Force(until) if now < until => Held::SystemDisplay,
-            _ => decide(cfg, ac, display_on, busy),
+            // 已归一化, 此处的 Force 必然未过期
+            Mode::Force(_) => Held::SystemDisplay,
+            Mode::Auto => decide(cfg, ac, display_on, busy),
         };
 
         let changed = desired != self.held;
@@ -315,5 +338,82 @@ mod tests {
             ..snap2
         };
         assert!(grace.describe().contains("宽限期"));
+    }
+
+    // ───────────────── Force 归一化 ─────────────────
+
+    /// 未到点的 Force 保持原样, 到点/过点的一律折叠成 Auto。
+    ///
+    /// 这条是"剩余 0 分 0 秒"那个显示缺陷的根: 判定按 Auto 走了,
+    /// 而 mode 还是 Force, 于是倒计时显示 0 却仍标称"强制常亮"。
+    #[test]
+    fn expired_force_normalizes_to_auto() {
+        let t0 = Instant::now();
+        let until = t0 + Duration::from_secs(60);
+
+        assert_eq!(Mode::Force(until).effective_at(t0), Mode::Force(until), "未到点");
+        assert_eq!(
+            Mode::Force(until).effective_at(until),
+            Mode::Auto,
+            "恰好到点即失效 —— 与 step 里 `now < until` 的旧判据一致"
+        );
+        assert_eq!(
+            Mode::Force(until).effective_at(until + Duration::from_secs(1)),
+            Mode::Auto
+        );
+    }
+
+    /// Auto / Paused 不受影响 —— 归一化只针对 Force
+    #[test]
+    fn normalize_leaves_other_modes_alone() {
+        let now = Instant::now();
+        assert_eq!(Mode::Auto.effective_at(now), Mode::Auto);
+        assert_eq!(Mode::Paused.effective_at(now), Mode::Paused);
+        // 幂等: 折叠后再折叠还是 Auto
+        let expired = Mode::Force(now).effective_at(now);
+        assert_eq!(expired.effective_at(now), Mode::Auto);
+    }
+
+    /// 过期的 Force 交给 step 时, 快照里的 mode 必须已是 Auto 且没有倒计时。
+    /// 否则托盘会显示"强制常亮 · 剩余 0 分 0 秒"。
+    #[test]
+    fn step_publishes_auto_for_expired_force() {
+        // step 会经 AudioDetector 摸 WASAPI: 需要进程 MTA 稳定存在
+        detect::com_test_guard();
+        let cfg = Config::from_text(crate::config::DEFAULT_CONFIG);
+        let mut e = Engine::new();
+        // 已经过期的 Force(用当前时刻作为截止时刻, step 里的 now 必然 >= 它)
+        let (snap, _) = e.step(&cfg, Mode::Force(Instant::now()), true);
+        assert_eq!(snap.mode, Mode::Auto, "过期 Force 应折叠为 Auto");
+        assert!(snap.force_left.is_none(), "不该再有倒计时");
+        assert!(!snap.describe().contains("强制常亮"), "得到 {}", snap.describe());
+        let _ = crate::power::apply_hold(Held::None);
+    }
+
+    /// 未过期的 Force 必须照常持有 system+display 并给出倒计时
+    #[test]
+    fn step_honors_live_force() {
+        detect::com_test_guard();
+        let cfg = Config::from_text(crate::config::DEFAULT_CONFIG);
+        let mut e = Engine::new();
+        let until = Instant::now() + Duration::from_secs(1800);
+        let (snap, _) = e.step(&cfg, Mode::Force(until), true);
+        assert_eq!(snap.mode, Mode::Force(until));
+        assert_eq!(snap.held, Held::SystemDisplay, "强制常亮必须同时保屏幕");
+        let left = snap.force_left.expect("应有倒计时").as_secs();
+        assert!((1700..=1800).contains(&left), "得到 {}s", left);
+        assert!(snap.describe().contains("强制常亮"));
+        let _ = crate::power::apply_hold(Held::None);
+    }
+
+    /// Paused 必须真的放手, 与检测结果无关
+    #[test]
+    fn step_paused_releases_everything() {
+        detect::com_test_guard();
+        let cfg = Config::from_text(crate::config::DEFAULT_CONFIG);
+        let mut e = Engine::new();
+        let (snap, _) = e.step(&cfg, Mode::Paused, true);
+        assert_eq!(snap.held, Held::None);
+        assert!(snap.force_left.is_none());
     }
 }

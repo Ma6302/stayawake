@@ -127,6 +127,132 @@ pub struct Config {
 
     /// 原始行, 回写时保留注释与未知键
     raw: Vec<String>,
+
+    /// 解析期间发现的问题(值无法解析、越界被夹取)。
+    ///
+    /// 这里只**收集**不写日志: `from_text` 在单测和 `set_and_save` 里都会被调用,
+    /// 在里面写日志会污染测试并且每次开关托盘都刷一遍。由调用方决定何时记录。
+    warnings: Vec<String>,
+}
+
+/// 取值并在值非法时留下痕迹。
+///
+/// 所有"回落到默认值"和"越界夹取"的分支都必须记一条 —— 静默回落会让用户
+/// 以为自己的配置生效了。实测最容易踩的是把阈值写成 0(会被夹到 1)
+/// 和把布尔写成 `enabled`/`disabled` 这类拼写(整项回落默认)。
+struct Reader {
+    map: Vec<(String, String)>,
+    warnings: Vec<String>,
+}
+
+impl Reader {
+    /// 键不存在时返回空串 —— 与"值为空"同等对待(都用默认值, 不算错误)
+    fn raw(&self, key: &str) -> &str {
+        self.map
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
+
+    fn invalid(&mut self, key: &str, got: &str, used: &dyn std::fmt::Display) {
+        self.warnings
+            .push(format!("config: {} = \"{}\" 无法解析, 使用默认值 {}", key, got, used));
+    }
+
+    fn bool(&mut self, key: &str, d: bool) -> bool {
+        let v = self.raw(key);
+        if v.is_empty() {
+            return d;
+        }
+        match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => {
+                let (v, d) = (v.to_string(), d);
+                self.invalid(key, &v, &d);
+                d
+            }
+        }
+    }
+
+    /// u64 + 范围夹取。夹取也要告警: `net_threshold_kbps = 0` 看着像"不设阈值",
+    /// 实际会被夹到 1 KB/s, 差别是"永不休眠"与"按 1 MB/s 判定"。
+    fn u64(&mut self, key: &str, d: u64, lo: u64, hi: u64) -> u64 {
+        let v = self.raw(key);
+        let parsed = if v.is_empty() {
+            d
+        } else {
+            match v.parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    let v = v.to_string();
+                    self.invalid(key, &v, &d);
+                    d
+                }
+            }
+        };
+        let used = parsed.clamp(lo, hi);
+        if used != parsed {
+            // hi 为 u64::MAX 时不要把它印出来(18446744073709551615 只会干扰阅读),
+            // 那种情况实际约束只有下界
+            if hi == u64::MAX {
+                self.warnings.push(format!(
+                    "config: {} = {} 小于下界 {}, 已按 {} 处理",
+                    key, parsed, lo, used
+                ));
+            } else {
+                self.warnings.push(format!(
+                    "config: {} = {} 超出允许范围 [{}, {}], 已按 {} 处理",
+                    key, parsed, lo, hi, used
+                ));
+            }
+        }
+        used
+    }
+
+    /// f64 + 下界。NaN 必须挡掉: `pct >= NaN` 恒假, 检测器会静默永不命中。
+    fn f64_min(&mut self, key: &str, d: f64, lo: f64) -> f64 {
+        let v = self.raw(key);
+        let parsed = if v.is_empty() {
+            d
+        } else {
+            match v.parse::<f64>() {
+                Ok(n) if n.is_finite() => n,
+                _ => {
+                    let v = v.to_string();
+                    self.invalid(key, &v, &d);
+                    d
+                }
+            }
+        };
+        if parsed < lo {
+            self.warnings.push(format!(
+                "config: {} = {} 小于下界 {}, 已按 {} 处理",
+                key, parsed, lo, lo
+            ));
+            return lo;
+        }
+        parsed
+    }
+
+    fn policy(&mut self, key: &str, d: &str) -> String {
+        let v = self.raw(key);
+        if v.is_empty() {
+            return d.to_string();
+        }
+        let lower = v.to_ascii_lowercase();
+        if lower == "system" || lower == "display" {
+            return lower;
+        }
+        let (v, d) = (v.to_string(), d.to_string());
+        self.invalid(key, &v, &d);
+        d
+    }
+
+    fn list(&self, key: &str) -> Vec<String> {
+        parse_list(self.raw(key))
+    }
 }
 
 fn strip_comment(s: &str) -> &str {
@@ -275,71 +401,55 @@ impl Config {
             }
         }
 
-        let get = |k: &str| -> &str {
-            map.iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("")
-        };
-        let b = |k: &str, d: bool| match get(k).to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => true,
-            "false" | "0" | "no" | "off" => false,
-            _ => d,
-        };
-        let u = |k: &str, d: u64| get(k).parse::<u64>().unwrap_or(d);
-        let f = |k: &str, d: f64| get(k).parse::<f64>().unwrap_or(d);
-        let policy = |k: &str, d: &str| -> String {
-            let v = get(k).to_ascii_lowercase();
-            if v == "system" || v == "display" {
-                v
-            } else {
-                d.to_string()
-            }
-        };
+        let mut r = Reader { map, warnings: Vec::new() };
 
+        // fast_poll 的上界是完整轮询间隔, 所以先算 poll_interval
+        let poll_interval_secs = r.u64("poll_interval_secs", 15, 1, 3600);
         Config {
-            poll_interval_secs: u("poll_interval_secs", 15).clamp(1, 3600),
-            // 0 = 关闭快速通道; 否则至少 1s, 且不超过完整轮询间隔
-            fast_poll_secs: {
-                let full = u("poll_interval_secs", 15).clamp(1, 3600);
-                let fast = u("fast_poll_secs", 2);
-                if fast == 0 {
-                    0
-                } else {
-                    fast.clamp(1, full)
-                }
+            poll_interval_secs,
+            // 0 = 关闭快速通道(不告警, 这是文档化的取值); 否则至少 1s 且不超过完整间隔
+            fast_poll_secs: if r.raw("fast_poll_secs").trim() == "0" {
+                0
+            } else {
+                r.u64("fast_poll_secs", 2, 1, poll_interval_secs)
             },
-            grace_secs: u("grace_secs", 90).min(3600),
-            policy_ac: policy("policy_ac", "system"),
-            policy_dc: policy("policy_dc", "display"),
-            never_wake_display: b("never_wake_display", true),
-            sleep_on_release: b("sleep_on_release", false),
+            grace_secs: r.u64("grace_secs", 90, 0, 3600),
+            policy_ac: r.policy("policy_ac", "system"),
+            policy_dc: r.policy("policy_dc", "display"),
+            never_wake_display: r.bool("never_wake_display", true),
+            sleep_on_release: r.bool("sleep_on_release", false),
 
-            audio_enabled: b("audio_enabled", true),
-            audio_peak_threshold: f("audio_peak_threshold", 0.0001),
-            audio_hold_secs: u("audio_hold_secs", 20).clamp(1, 600),
-            audio_ignore: parse_list(get("audio_ignore")),
+            audio_enabled: r.bool("audio_enabled", true),
+            audio_peak_threshold: r.f64_min("audio_peak_threshold", 0.0001, 1e-6),
+            audio_hold_secs: r.u64("audio_hold_secs", 20, 1, 600),
+            audio_ignore: r.list("audio_ignore"),
 
-            net_enabled: b("net_enabled", true),
+            net_enabled: r.bool("net_enabled", true),
             // 阈值为 0 会让 "kbps < 0" 永假 -> 零流量也每 tick 命中 -> 永久持有
-            net_threshold_kbps: u("net_threshold_kbps", 1024).max(1),
-            net_min_consecutive_tick: u("net_min_consecutive_tick", 2).clamp(1, 100) as u32,
+            net_threshold_kbps: r.u64("net_threshold_kbps", 1024, 1, u64::MAX),
+            net_min_consecutive_tick: r.u64("net_min_consecutive_tick", 2, 1, 100) as u32,
 
-            proc_enabled: b("proc_enabled", true),
-            proc_cpu_percent_1core: f("proc_cpu_percent_1core", 5.0),
-            proc_busy_when_cpu: parse_list(get("proc_busy_when_cpu")),
+            proc_enabled: r.bool("proc_enabled", true),
+            proc_cpu_percent_1core: r.f64_min("proc_cpu_percent_1core", 5.0, 0.1),
+            proc_busy_when_cpu: r.list("proc_busy_when_cpu"),
 
-            dl_enabled: b("dl_enabled", true),
-            dl_processes: parse_list(get("dl_processes")),
+            dl_enabled: r.bool("dl_enabled", true),
+            dl_processes: r.list("dl_processes"),
             // 阈值不能为 0: 那会让"零流量也判定为忙"从而永久持有
-            dl_io_kbps: u("dl_io_kbps", 50).max(1),
-            dl_tcp_conns: u("dl_tcp_conns", 4).clamp(1, 10000) as u32,
+            dl_io_kbps: r.u64("dl_io_kbps", 50, 1, u64::MAX),
+            dl_tcp_conns: r.u64("dl_tcp_conns", 4, 1, 10000) as u32,
 
-            hint_enabled: b("hint_enabled", true),
-            hint_ttl_secs: u("hint_ttl_secs", 60).max(10),
+            hint_enabled: r.bool("hint_enabled", true),
+            hint_ttl_secs: r.u64("hint_ttl_secs", 60, 10, u64::MAX),
 
             raw,
+            warnings: r.warnings,
         }
+    }
+
+    /// 解析期间发现的非法值/夹取。由 worker 加载后记一次日志, `--status` 也会打印。
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// 就地替换某键的值, 返回完整的新文件内容。**不落盘**, 便于单测。
@@ -381,8 +491,31 @@ impl Config {
     /// 返回是否成功落盘。失败(只读文件/磁盘满/ACL)必须让调用方知道 ——
     /// 否则托盘上的勾看起来变了, 下次加载又变回去, 用户完全不明白发生了什么。
     pub fn set_and_save(&mut self, key: &str, value: &str) -> Result<(), String> {
-        let text = self.rewrite(key, value);
-        let result = write_atomic(&config_path(), &text).map_err(|e| e.to_string());
+        self.set_and_save_at(&config_path(), key, value)
+    }
+
+    /// `set_and_save` 的可注入路径版本, 便于单测(不去碰用户真实配置)。
+    ///
+    /// **以磁盘当前内容为基准**, 不是 `self.raw`。`self` 可能是很早读入的快照
+    /// (调用方缓存、或用户在这期间用记事本改了配置), 拿旧 raw 回写会把
+    /// 中途的全部外部修改一起覆盖掉 —— 改一个开关丢一整份配置。
+    ///
+    /// 记事本这类外部编辑器不参与任何锁, 所以"读-改-写"窗口只能压到最小
+    /// (这里是几十微秒), 无法彻底消除。
+    fn set_and_save_at(
+        &mut self,
+        path: &std::path::Path,
+        key: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        // 读不到或是空文件时退回内存快照: 至少本次改动不丢。
+        // (空文件的处理与 load_or_create 一致 —— 不拿它覆盖用户配置)
+        let mut base = match std::fs::read_to_string(path) {
+            Ok(t) if !t.trim().is_empty() => Config::from_text(&t),
+            _ => self.clone(),
+        };
+        let text = base.rewrite(key, value);
+        let result = write_atomic(path, &text).map_err(|e| e.to_string());
         // 无论是否落盘成功, 内存里的 self 都更新为新值:
         // 失败时至少本次运行的行为符合用户意图
         *self = Config::from_text(&text);
@@ -512,5 +645,161 @@ mod tests {
     fn migrate_is_idempotent() {
         let once = migrate_text(DEFAULT_CONFIG);
         assert_eq!(once, DEFAULT_CONFIG, "键齐全时不该改动");
+    }
+
+    // ───────────────── 配置告警 ─────────────────
+
+    /// 默认配置不能产生任何告警 —— 否则每次启动都刷日志
+    #[test]
+    fn default_config_has_no_warnings() {
+        assert!(
+            Config::from_text(DEFAULT_CONFIG).warnings().is_empty(),
+            "默认配置本身就该是干净的: {:?}",
+            Config::from_text(DEFAULT_CONFIG).warnings()
+        );
+    }
+
+    /// 缺键(旧版配置)不算错误, 静默用默认值即可
+    #[test]
+    fn missing_keys_produce_no_warnings() {
+        assert!(Config::from_text("").warnings().is_empty());
+        assert!(Config::from_text("audio_enabled = true\n").warnings().is_empty());
+    }
+
+    /// 无法解析的值必须留痕。静默回落会让用户以为自己写的值生效了。
+    #[test]
+    fn unparsable_values_are_reported() {
+        let cfg = Config::from_text(
+            "poll_interval_secs = abc\naudio_enabled = enabled\npolicy_ac = 乱写\n",
+        );
+        let w = cfg.warnings().join("\n");
+        assert!(w.contains("poll_interval_secs"), "缺 poll_interval_secs: {}", w);
+        assert!(w.contains("audio_enabled"), "缺 audio_enabled: {}", w);
+        assert!(w.contains("policy_ac"), "缺 policy_ac: {}", w);
+        // 行为不变: 仍回落默认值
+        assert_eq!(cfg.poll_interval_secs, 15);
+        assert!(cfg.audio_enabled);
+        assert_eq!(cfg.policy_ac, "system");
+    }
+
+    /// 夹取也要报。`net_threshold_kbps = 0` 看着像"不设阈值",
+    /// 实际被夹到 1 KB/s —— 差别是"永不休眠"与"按 1 MB/s 判定"。
+    #[test]
+    fn clamped_values_are_reported() {
+        let cfg = Config::from_text("net_threshold_kbps = 0\ndl_io_kbps = 0\n");
+        let w = cfg.warnings().join("\n");
+        assert!(w.contains("net_threshold_kbps"), "夹取未告警: {}", w);
+        assert!(w.contains("dl_io_kbps"), "夹取未告警: {}", w);
+        assert!(cfg.net_threshold_kbps >= 1);
+        assert!(cfg.dl_io_kbps >= 1);
+    }
+
+    /// `fast_poll_secs = 0` 是文档化的"关闭快速通道", 不是错误
+    #[test]
+    fn fast_poll_zero_is_not_a_warning() {
+        let cfg = Config::from_text("fast_poll_secs = 0\n");
+        assert_eq!(cfg.fast_poll_secs, 0);
+        assert!(cfg.warnings().is_empty(), "得到 {:?}", cfg.warnings());
+    }
+
+    /// NaN 必须挡掉: `pct >= NaN` 恒假, 检测器会静默永不命中 ——
+    /// 比"回落默认值"隐蔽得多。
+    #[test]
+    fn nan_threshold_falls_back_and_warns() {
+        let cfg = Config::from_text("proc_cpu_percent_1core = NaN\n");
+        assert!(cfg.proc_cpu_percent_1core.is_finite(), "NaN 会让比较恒假");
+        assert_eq!(cfg.proc_cpu_percent_1core, 5.0);
+        assert!(!cfg.warnings().is_empty());
+    }
+
+    /// 负阈值同理: 会让"任何读数都算超标"从而永久持有
+    #[test]
+    fn negative_threshold_is_clamped_and_warned() {
+        let cfg = Config::from_text("proc_cpu_percent_1core = -5\naudio_peak_threshold = -1\n");
+        assert!(cfg.proc_cpu_percent_1core > 0.0);
+        assert!(cfg.audio_peak_threshold > 0.0);
+        assert_eq!(cfg.warnings().len(), 2, "两个都该报: {:?}", cfg.warnings());
+    }
+
+    // ───────────────── set_and_save 基准 ─────────────────
+
+    fn temp_cfg(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("stayawake_cfg_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join(name);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// 核心回归: 写回必须以**磁盘当前内容**为基准, 不是内存里的旧快照。
+    /// 否则用户在托盘打开菜单期间用记事本改了配置, 点一个开关就把改动全冲掉。
+    #[test]
+    fn set_and_save_uses_disk_as_base_not_stale_snapshot() {
+        let p = temp_cfg("stale.ini");
+        std::fs::write(&p, "audio_enabled = true\nnet_enabled = true\n").unwrap();
+
+        // 托盘在这一刻读到的快照
+        let mut stale = Config::from_text(&std::fs::read_to_string(&p).unwrap());
+
+        // 用户随后用记事本加了一项、并改了另一项
+        std::fs::write(
+            &p,
+            "audio_enabled = true\nnet_enabled = false\ngrace_secs = 300\n",
+        )
+        .unwrap();
+
+        // 托盘点了"检测: 音频播放"
+        stale.set_and_save_at(&p, "audio_enabled", "false").unwrap();
+
+        let after = Config::from_text(&std::fs::read_to_string(&p).unwrap());
+        assert!(!after.audio_enabled, "本次改动要生效");
+        assert!(!after.net_enabled, "外部修改被旧快照覆盖了");
+        assert_eq!(after.grace_secs, 300, "外部新增的键被丢掉了");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 磁盘上的注释必须保留 —— 用户看到的说明文字都在注释里
+    #[test]
+    fn set_and_save_preserves_disk_comments() {
+        let p = temp_cfg("comments.ini");
+        std::fs::write(&p, "# 我的说明\naudio_enabled = true   # 行尾\n").unwrap();
+        let mut cfg = Config::from_text("audio_enabled = true\n");
+        cfg.set_and_save_at(&p, "audio_enabled", "false").unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("# 我的说明"));
+        assert!(text.contains("# 行尾"), "行尾注释丢了: {}", text);
+        assert!(!Config::from_text(&text).audio_enabled);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 文件不存在或被清空时退回内存快照, 本次改动不能丢
+    #[test]
+    fn set_and_save_falls_back_when_file_unusable() {
+        let p = temp_cfg("missing.ini");
+        let mut cfg = Config::from_text("audio_enabled = true\nnet_enabled = true\n");
+        cfg.set_and_save_at(&p, "audio_enabled", "false").unwrap();
+        let after = Config::from_text(&std::fs::read_to_string(&p).unwrap());
+        assert!(!after.audio_enabled);
+        assert!(after.net_enabled, "内存快照里的其余键应保留");
+
+        // 空文件同样走退回路径
+        std::fs::write(&p, "   \n").unwrap();
+        let mut cfg2 = Config::from_text("hint_enabled = true\n");
+        cfg2.set_and_save_at(&p, "hint_enabled", "false").unwrap();
+        assert!(!Config::from_text(&std::fs::read_to_string(&p).unwrap()).hint_enabled);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 落盘后内存里的 self 必须同步为新值(托盘紧接着就要用它渲染勾选)
+    #[test]
+    fn set_and_save_updates_self_in_memory() {
+        let p = temp_cfg("selfsync.ini");
+        std::fs::write(&p, DEFAULT_CONFIG).unwrap();
+        let mut cfg = Config::from_text(DEFAULT_CONFIG);
+        assert!(cfg.dl_enabled);
+        cfg.set_and_save_at(&p, "dl_enabled", "false").unwrap();
+        assert!(!cfg.dl_enabled);
+        let _ = std::fs::remove_file(&p);
     }
 }

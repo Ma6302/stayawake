@@ -205,6 +205,47 @@ impl RateMeter {
 }
 
 #[cfg(test)]
+/// 测试专用: 保证进程 MTA 在整个测试期间一直存在。
+///
+/// 背景(实测确认, 独立复现程序已验证): 进程的 MTA 只由**显式** `CoInitializeEx`
+/// 的线程计引用。没调 `CoInitializeEx` 就直接 `CoCreateInstance` 是合法的
+/// "隐式 MTA", 但它**不给 MTA 计引用**。所以只要最后一个显式引用者放弃
+/// (`CoUninitialize` 或**线程直接退出**), MTA 就被拆掉, 隐式线程手里的 COM 对象
+/// 立刻悬垂 —— 下次使用即 `0xC0000005`。
+///
+/// libtest 每个测试跑在自己的线程上并在结束时退出, 于是 `detect::audio` /
+/// `engine::step_*` 这些会摸 WASAPI 的测试彼此是隐式/显式混合, 谁先结束完全取决于调度。
+/// 结果就是 `cargo test` 间歇性崩溃(实测约一半概率), 且崩在哪个测试每次都不同。
+///
+/// 做法: 起一个永不退出的守卫线程持有 MTA 引用。所有摸 COM 的测试先调这个函数。
+/// 线程随进程结束由系统回收, 没有泄漏问题。
+pub fn com_test_guard() {
+    use std::sync::mpsc;
+    use std::sync::OnceLock;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    static GUARD: OnceLock<()> = OnceLock::new();
+    GUARD.get_or_init(|| {
+        let (up_tx, up_rx) = mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("com-mta-guard".into())
+            .spawn(move || {
+                unsafe {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                }
+                let _ = up_tx.send(());
+                // 永不退出: 一退出 MTA 就没了, 这个函数也就白做了
+                loop {
+                    std::thread::park();
+                }
+            })
+            .expect("spawn com-mta-guard");
+        // 等 MTA 真的建立起来再放调用方过去
+        let _ = up_rx.recv();
+    });
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;

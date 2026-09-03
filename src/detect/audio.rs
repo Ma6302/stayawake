@@ -275,18 +275,19 @@ impl Detector for AudioDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
     fn cfg() -> Config {
         Config::from_text(crate::config::DEFAULT_CONFIG)
     }
 
-    /// COM 未初始化时不该 panic, 只是拿不到枚举器
+    /// 本线程没调 CoInitializeEx 时不该 panic —— 拿不到枚举器就走降级路径。
+    /// (守卫线程保证进程 MTA 存在, 但**本线程**仍未显式初始化 COM, 这正是要覆盖的情形。)
     #[test]
     fn works_without_com_init() {
+        super::super::com_test_guard();
         let mut d = AudioDetector::default();
         let c = cfg();
-        // 不 CoInitialize 直接调用
+        // 本线程不 CoInitializeEx, 直接调用
         let _ = d.probe(&c);
         let _ = d.tick(&c, &ProcessTable::default());
         assert!(!d.status_lines(&c).is_empty());
@@ -304,11 +305,14 @@ mod tests {
     }
 
     /// 真实 WASAPI 枚举: 本机至少有一个输出端点
+    ///
+    /// 必须走 `com_test_guard()`, 不要在这里 `CoInitializeEx` + `CoUninitialize`:
+    /// 测试全跑在一个进程里, 拆掉 MTA 会让其他线程(engine 的 step 测试等)
+    /// 手里的 COM 对象悬垂, 表现为 `cargo test` 间歇性 `0xC0000005`。详见
+    /// `detect::com_test_guard` 的注释。
     #[test]
     fn enumerates_real_endpoints() {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        }
+        super::super::com_test_guard();
         let mut d = AudioDetector::default();
         let c = cfg();
         let _ = d.tick(&c, &ProcessTable::snapshot());
@@ -323,8 +327,6 @@ mod tests {
                 );
             }
         }
-        drop(d);
-        unsafe { CoUninitialize() };
     }
 
     /// 忽略名单里的进程即使在响也不该产生 reason —— 壁纸软件常驻出声

@@ -155,6 +155,10 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let mut cfg = config::Config::load_or_create();
+    // 已记录过的配置告警。托盘每次开关都会触发重载, 若不去重, 一个写错的
+    // 阈值会在用户连点菜单时反复刷日志(1MB 只留一代, 历史会被冲掉)。
+    let mut logged_warnings: Vec<String> = Vec::new();
+    log_config_warnings(&cfg, &mut logged_warnings);
     let mut engine = Engine::new();
     let mut hwnd: Option<HWND> = None;
     // 上次完整检测的时刻。None = 还没做过, 立刻做一次。
@@ -180,6 +184,7 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
             cfg = config::Config::load_or_create();
             last_full = None; // 配置变了, 立刻重做完整检测
             log::event("config reloaded");
+            log_config_warnings(&cfg, &mut logged_warnings);
         }
         if hwnd.is_none() {
             hwnd = hwnd_rx.try_recv().ok();
@@ -204,25 +209,12 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
         kicked = false;
         let _ = kicked;
 
-        let mode = *lock(&shared.mode);
+        let mode = take_mode(&shared);
         let display_on = shared.display_on.load(Ordering::SeqCst);
         let prev_held = engine.held();
         let prev_in_grace = engine.in_grace();
         let (snap, changed) = engine.step(&cfg, mode, display_on);
         last_full = Some(Instant::now());
-
-        // Force 到点自动回 Auto。
-        // 必须在同一个锁作用域内做 compare-and-set: mode 是 ~11ms 前读的,
-        // 期间用户可能点了"强制常亮 1 小时"或"暂停", 无条件写回会把它覆盖掉
-        // (表现为"点了没反应")。只有当锁里的值仍是我们看到的那个 Force 才归零。
-        if let Mode::Force(until) = mode {
-            if Instant::now() >= until {
-                let mut cur = lock(&shared.mode);
-                if *cur == Mode::Force(until) {
-                    *cur = Mode::Auto;
-                }
-            }
-        }
 
         if changed {
             let what = if snap.reasons.is_empty() {
@@ -271,13 +263,47 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
         //
         // 关键: 这里也要用快速间隔。否则"完整检测发现无活动"之后会睡满 poll_interval,
         // 快速通道形同虚设 —— 只有紧跟在 probe 之后的那一轮才快。
-        let next = if watching(&cfg, &engine, &shared) {
+        let base = if watching(&cfg, &engine, &shared) {
             cfg.fast_poll_secs
         } else {
             cfg.poll_interval_secs
         };
+        // 重读一次锁: 上面那次读之后用户可能又改了模式
+        let next = clamp_to_force_deadline(base, *lock(&shared.mode), Instant::now());
         kicked = wait_next(timer, shared.kick, next);
     }
+}
+
+/// 读取当前模式, 顺手把**已过期的 Force 归一化为 Auto**。
+///
+/// 归一化必须发生在 `step()` **之前**: 否则这一轮的快照里 mode 仍是 Force
+/// 而剩余时间已经是 0, 托盘会显示"强制常亮 · 剩余 0 分 0 秒"这种自相矛盾的状态。
+///
+/// 整个读-判-写在同一次加锁内完成, 所以不存在"用户刚点的模式被覆盖"的窗口
+/// (先前的实现在 step 之后才回写, 隔着约 11ms 的进程快照, 必须做 compare-and-set)。
+fn take_mode(shared: &Arc<Shared>) -> Mode {
+    let mut cur = lock(&shared.mode);
+    let eff = cur.effective();
+    if eff != *cur {
+        *cur = eff;
+    }
+    eff
+}
+
+/// 把本轮休眠时长压到不晚于"强制常亮"的截止时刻。
+///
+/// 不这么做的话"强制常亮 30 分钟"实际会持有 30 分钟 + 最多一个 poll_interval:
+/// Force 期间 `watching()` 为假(已持有请求), 睡的是整个 15s, 到点也没人醒过来释放。
+fn clamp_to_force_deadline(base_secs: u64, mode: Mode, now: Instant) -> u64 {
+    let Mode::Force(until) = mode else {
+        return base_secs;
+    };
+    let left = until.saturating_duration_since(now);
+    // 向上取整: 截断会让定时器早于截止时刻到期, 白跑一轮。
+    // 下限 1s: 已经过期(left = 0)时取 0 会变成"立即到期"的忙等,
+    // 而过期后的这一轮必然把 mode 归一化为 Auto, 等 1s 无影响。
+    let left_secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    base_secs.min(left_secs).max(1)
 }
 
 /// 是否处于"快速盯梢"状态: 空闲 + 自动模式 + 启用了快速通道。
@@ -287,6 +313,19 @@ fn watching(cfg: &config::Config, engine: &Engine, shared: &Arc<Shared>) -> bool
         && cfg.fast_poll_secs < cfg.poll_interval_secs
         && engine.held() == Held::None
         && matches!(*lock(&shared.mode), Mode::Auto)
+}
+
+/// 把配置里的非法值/夹取记进日志。静默回落到默认值会让用户以为自己写的值生效了 ——
+/// 而这类错误的后果恰恰是"永不休眠"或"检测器永不命中"这种难以自查的行为。
+///
+/// `seen` 用来去重: 同一条告警只记一次, 否则连点托盘开关会刷屏。
+fn log_config_warnings(cfg: &config::Config, seen: &mut Vec<String>) {
+    for w in cfg.warnings() {
+        if !seen.iter().any(|s| s == w) {
+            seen.push(w.clone());
+            log::event(&format!("warn: {}", w));
+        }
+    }
 }
 
 /// 等到定时器到期或被 UI 线程踢醒。定时器用一次性模式, 每次调用重新武装。
@@ -367,6 +406,14 @@ fn print_status() {
         ),
         String::new(),
     ];
+    // 配置里的非法值/夹取: 调阈值时最需要看到的就是"我写的值没被采纳"
+    if !cfg.warnings().is_empty() {
+        out.push("[配置告警]".to_string());
+        for w in cfg.warnings() {
+            out.push(format!("  {}", w));
+        }
+        out.push(String::new());
+    }
     out.extend(engine.status_lines(&cfg));
     out.push(String::new());
     out.push("[结论]".to_string());
@@ -420,5 +467,54 @@ fn write_console(s: &str) {
             let _ = WriteConsoleW(h, bytes, Some(&mut written), None);
         }
         let _ = FreeConsole();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 无 Force 时不影响原本的休眠时长
+    #[test]
+    fn force_deadline_does_not_affect_other_modes() {
+        let now = Instant::now();
+        assert_eq!(clamp_to_force_deadline(15, Mode::Auto, now), 15);
+        assert_eq!(clamp_to_force_deadline(15, Mode::Paused, now), 15);
+    }
+
+    /// 截止时刻早于常规间隔时必须提前醒 —— 否则"强制常亮 30 分钟"会多持有
+    /// 最多一个 poll_interval(Force 期间 watching() 为假, 睡满 15s)
+    #[test]
+    fn force_deadline_shortens_sleep() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(4);
+        assert_eq!(clamp_to_force_deadline(15, Mode::Force(until), now), 4);
+    }
+
+    /// 非整秒必须向上取整: 截断会让定时器早于截止时刻到期, 白跑一轮
+    #[test]
+    fn force_deadline_rounds_up() {
+        let now = Instant::now();
+        let until = now + Duration::from_millis(3200);
+        assert_eq!(clamp_to_force_deadline(15, Mode::Force(until), now), 4);
+    }
+
+    /// 截止时刻还很远时不该拉长休眠(只取更小的那个)
+    #[test]
+    fn force_deadline_never_lengthens_sleep() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(3600);
+        assert_eq!(clamp_to_force_deadline(2, Mode::Force(until), now), 2);
+        assert_eq!(clamp_to_force_deadline(15, Mode::Force(until), now), 15);
+    }
+
+    /// 已过期时不能返回 0: 那会让定时器立即到期, 变成忙等一核。
+    /// 过期后的这一轮必然把 mode 归一化为 Auto, 所以等 1s 无影响。
+    #[test]
+    fn expired_force_never_yields_busy_loop() {
+        let now = Instant::now();
+        assert_eq!(clamp_to_force_deadline(15, Mode::Force(now), now), 1);
+        let past = now - Duration::from_secs(10);
+        assert_eq!(clamp_to_force_deadline(15, Mode::Force(past), now), 1);
     }
 }
