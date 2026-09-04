@@ -12,7 +12,7 @@
 
 #define AppName "stayawake"
 ; 必须与 Cargo.toml 的 version 一致。改版本号时两处一起改。
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define AppPublisher "Ma6302"
 #define AppURL "https://github.com/Ma6302/stayawake"
 #define ExeName "stayawake.exe"

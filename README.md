@@ -457,7 +457,7 @@ cargo clippy --release --all-targets
 cargo build --release
 .\target\release\stayawake.exe --write-ico installer\stayawake.ico
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\stayawake.iss
-# 产物: dist\stayawake-0.1.0-setup.exe
+# 产物: dist\stayawake-0.1.1-setup.exe
 ```
 
 图标是**从代码生成**的，不是手工维护的资源文件 —— `--write-ico` 复用 `tray.rs`
