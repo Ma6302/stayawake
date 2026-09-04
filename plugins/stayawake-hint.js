@@ -22,52 +22,73 @@ export const StayAwakeHint = async () => {
   /** 未 idle 的会话 ID -> 它在忙什么 */
   const busy = new Map()
   let timer = null
+  // sync 是否正在执行, 以及执行期间是否又有新请求(合并用)
+  let running = false
+  let again = false
 
-  const write = async () => {
-    const reason = busy.size ? [...busy.values()].join(", ") : "busy"
-    try {
-      await mkdir(HINT_DIR, { recursive: true })
-      await writeFile(HINT_FILE, `${reason}\n${new Date().toISOString()}\n`)
-    } catch {
-      // stayawake 没装/没跑都不影响 OpenCode 本身
+  // 把 hint 文件同步到**当前** busy 状态: 有会话在忙就刷新文件(更新 mtime),
+  // 全空了就删除。
+  //
+  // 关键: 写还是删, 必须按**执行那一刻**的 busy 决定, 且全程串行。否则会出现
+  // 写-删竞态 —— mark 的异步写(mkdir+writeFile 两步)与 done 的异步删(一步 rm)
+  // 并发时, 删先完成、写后落地, 于是文件在会话结束后残留, 定时器已停, 只能等
+  // TTL(60s) 过期。实测现象: opencode 空闲后托盘仍显示
+  // hint:opencode.hint(thinking), 过一会才消失。
+  //
+  // running/again 做合并: 流式输出高频触发, 在途时后来的调用只置 again, 结束后
+  // 补一轮即可, 免得把上百次写排进队列。补的那一轮读的是最新 busy, 所以状态一定收敛。
+  const sync = async () => {
+    if (running) {
+      again = true
+      return
     }
-  }
-
-  const clear = async () => {
+    running = true
     try {
-      await rm(HINT_FILE, { force: true })
-    } catch {}
+      do {
+        again = false
+        try {
+          if (busy.size > 0) {
+            const reason = [...busy.values()].join(", ")
+            await mkdir(HINT_DIR, { recursive: true })
+            await writeFile(HINT_FILE, `${reason}\n${new Date().toISOString()}\n`)
+          } else {
+            await rm(HINT_FILE, { force: true })
+          }
+        } catch {
+          // stayawake 没装/没跑都不影响 OpenCode 本身
+        }
+      } while (again)
+    } finally {
+      running = false
+    }
   }
 
   /** 标记某会话在忙。sessionID 缺失时用固定键, 至少不会漏。 */
-  const mark = async (sessionID, what) => {
+  const mark = (sessionID, what) => {
     busy.set(sessionID ?? "-", what)
     if (!timer) {
-      // 模型思考期间可能长时间没有任何事件, 定时器保证 mtime 不过期
+      // 模型思考期间可能长时间没有任何事件, 定时器保证 mtime 不过期。
+      // 定时器只管触发 sync, 由 sync 按 busy 判断写还是删。
       timer = setInterval(() => {
-        if (busy.size) write()
+        sync()
       }, REFRESH_MS)
       timer.unref?.()
     }
-    await write()
+    return sync()
   }
 
   /** 某会话结束。全部结束后才释放。 */
-  const done = async (sessionID) => {
+  const done = (sessionID) => {
     busy.delete(sessionID ?? "-")
-    if (busy.size === 0) {
-      if (timer) {
-        clearInterval(timer)
-        timer = null
-      }
-      await clear()
-    } else {
-      await write()
+    if (busy.size === 0 && timer) {
+      clearInterval(timer)
+      timer = null
     }
+    return sync()
   }
 
-  // 启动时清掉上次异常退出留下的陈旧文件
-  await clear()
+  // 启动时清掉上次异常退出留下的陈旧文件(busy 为空 -> sync 走删除分支)
+  await sync()
 
   return {
     "tool.execute.before": async (input) => mark(input.sessionID, `tool:${input.tool}`),

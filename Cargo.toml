@@ -31,6 +31,10 @@ windows = { version = "0.52", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# 只在构建期用: 把 build.rs 生成的 .ico 嵌进 exe 资源段。不进最终产物。
+[build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = "z"
 lto = true

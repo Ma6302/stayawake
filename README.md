@@ -9,11 +9,11 @@
 Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在下载」「Agent 在跑任务」，
 于是这些场景下机器照样熄屏休眠。stayawake 补上这一层判断。
 
-- 单个原生 exe，**388 KB**，无运行时依赖
+- 单个原生 exe，**420 KB**（含内嵌图标），无运行时依赖
 - 实测常驻开销：**私有内存 2.4 MB，CPU 0.14%/单核**（20 核机器上约占总算力 0.007%）
 - 检测延迟 **2 秒**（廉价探测走快速通道，完整检测仍是 15 秒一轮）
 - 对游戏无影响：EcoQoS 丢到 E-core、BelowNormal 优先级、**绝不调 `timeBeginPeriod`**
-- 117 个单元测试
+- 119 个单元测试
 
 ---
 
@@ -37,7 +37,7 @@ Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在
 
 ```powershell
 cargo build --release
-cargo test --release          # 117 个单元测试
+cargo test --release          # 119 个单元测试
 
 # 看一眼各检测器读数（不常驻，调阈值用）
 .\target\release\stayawake.exe --status
@@ -228,7 +228,7 @@ $h = [T.W]::FindWindowW("stayawake_msgwnd","stayawake")
 
 ## 已验证
 
-**117 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
+**119 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
 
 | 模块 | 测试重点 |
 |---|---|
@@ -433,7 +433,7 @@ hint_ttl_secs = 60
 
 ```powershell
 cargo build --release   # 产物: target\release\stayawake.exe
-cargo test --release    # 117 个单元测试
+cargo test --release    # 119 个单元测试
 cargo clippy --release --all-targets
 ```
 

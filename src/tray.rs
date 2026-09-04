@@ -42,6 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{self, Config};
 use crate::engine::Mode;
+use crate::icon::{self, Look};
 use crate::power::Held;
 use crate::{log, Shared, WM_STATE_CHANGED};
 
@@ -179,15 +180,6 @@ fn policy_items(ac: bool) -> (String, String) {
 
 // ───────────────────────────── 托盘图标 ─────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Look {
-    Idle,          // 灰
-    System,        // 琥珀: 仅防睡
-    SystemDisplay, // 蓝: 保持屏幕
-    Force,         // 蓝 + 绿点
-    Paused,        // 红 + 白斜杠
-}
-
 fn current_look() -> Look {
     let s = shared();
     // 两个锁分开取, 不嵌套 —— 避免建立隐式锁序(match 的临时值会活到整个 match 结束)
@@ -281,162 +273,15 @@ fn remove_icon(hwnd: HWND) {
     }
 }
 
-/// 32x32 32bpp DIB 上画个实心圆, 颜色即状态。掩码位图必须与颜色位图同尺寸,
-/// 传 1x1 会让 CreateIconIndirect 返回 E_INVALIDARG。
-///
-/// 全程用 `?` 而非 `expect`: 这个函数的失败原因恰恰是 GDI 句柄耗尽,
-/// 若在中途 panic 会漏掉已创建的对象 -> 下次更容易失败 -> 泄漏自我强化。
-/// 而且 panic 会跨 `extern "system"` 的 wnd_proc 边界导致整个进程 abort。
-/// 返回 None 时调用方降级为"不更新图标", 托盘保留上一个图标。
+/// 颜色即状态: 灰=空闲, 琥珀=仅防睡, 蓝=保持屏幕, 蓝+绿点=强制常亮, 红+斜杠=暂停。
+/// 像素怎么画在 `crate::icon`(纯 std, 与 build.rs 共用), 这里只负责包成 HICON。
 fn draw_icon(look: Look) -> Option<HICON> {
-    make_icon(&paint_icon(look))
+    make_icon(&icon::paint(look, ICON_SIZE))
 }
 
 /// 图标边长。托盘实际只要 16x16(100% DPI), 给 32x32 让 shell 降采样 ——
 /// 比让它把小图升采样清晰。
 const ICON_SIZE: usize = 32;
-/// 每像素每轴的超采样数, 用于抗锯齿。4x4=16 个样本足够让 32→16 降采样后边缘干净。
-const ICON_AA: u32 = 4;
-
-/// 产品图标(蓝色实心圆, 不带角标)的像素, 供 `--write-ico` 生成 .ico 用。
-///
-/// 与托盘图标共用同一个光栅化器, 所以两者不可能画得不一样。
-pub fn product_icon_pixels(size: usize) -> Vec<u32> {
-    paint_icon_at(Look::SystemDisplay, size)
-}
-
-/// (r, g, b)。**故意不用 COLORREF 的 `0x00bbggrr` 排布** —— 那种写法下
-/// `0x0000B3FF` 到底是琥珀还是天蓝, 只能靠数字节数, 读代码的人必然会读错。
-type Rgb = (u8, u8, u8);
-
-fn palette(look: Look) -> Rgb {
-    match look {
-        Look::Idle => (160, 160, 160),                          // 灰
-        Look::System => (255, 179, 0),                          // 琥珀: 仅防睡
-        Look::SystemDisplay | Look::Force => (61, 123, 255),     // 蓝: 保持屏幕
-        Look::Paused => (204, 51, 51),                          // 红
-    }
-}
-
-/// 把一个状态光栅化成 32x32 的**预乘 alpha** BGRA 缓冲, **自上而下**(row 0 = 顶部)。
-///
-/// ## 为什么自己光栅化而不用 GDI
-///
-/// `Ellipse` / `LineTo` 只写 RGB 三个字节, **完全不碰 alpha** —— GDI 对 32bpp DIB
-/// 的 alpha 语义是未定义的。缓冲区按"全透明"清零之后, 画上去的像素 alpha 仍是 0,
-/// 于是 `CreateIconIndirect` 拿到一张处处全透明的位图, 托盘只能显示空白。
-///
-/// 实测(独立诊断程序, 逐字复制旧的 GDI 绘制步骤): `Ellipse` + `LineTo` 之后
-/// **290 个像素 RGB 非零, 而 alpha 非零的像素是 0 个**; 走完 `CreateIconIndirect`
-/// 再 `GetDIBits` 回读, alpha 依然全零。
-///
-/// Windows 有个"alpha 全零就当没有 alpha 通道、退回用掩码"的兜底, 但各渲染路径
-/// 并不一致 —— 这正是"双击一下能看见、过一会儿又变空白"的来源。既然不能依赖它,
-/// 就必须自己把 alpha 写对。
-fn paint_icon(look: Look) -> Vec<u32> {
-    paint_icon_at(look, ICON_SIZE)
-}
-
-/// `paint_icon` 的任意边长版本。几何按 32px 设计, 其余尺寸整体缩放 ——
-/// .ico 需要多种尺寸, 而让 shell 从一张 32px 图降采样到 16px 会糊。
-fn paint_icon_at(look: Look, size: usize) -> Vec<u32> {
-    let mut px = vec![0u32; size * size];
-    let k = size as f32 / 32.0;
-    let c = size as f32 / 2.0;
-
-    // 主体圆: 与旧版 Ellipse(6,6)-(26,26) 同几何 —— 圆心 (16,16), 半径 10
-    fill_disc(&mut px, size, (c, c), 10.0 * k, palette(look));
-
-    match look {
-        // 绿点在右上: 旧版 Ellipse(20,6)-(28,14) —— 圆心 (24,10), 半径 4
-        Look::Force => fill_disc(&mut px, size, (24.0 * k, 10.0 * k), 4.0 * k, (0, 224, 0)),
-        // 白色斜杠: 旧版 (7,25)->(25,7), 线宽 4
-        Look::Paused => stroke_line(
-            &mut px,
-            size,
-            (7.0 * k, 25.0 * k),
-            (25.0 * k, 7.0 * k),
-            4.0 * k,
-            (255, 255, 255),
-        ),
-        _ => {}
-    }
-    px
-}
-
-fn fill_disc(px: &mut [u32], size: usize, (cx, cy): (f32, f32), radius: f32, color: Rgb) {
-    let rr = radius * radius;
-    composite(px, size, color, |x, y| {
-        let (dx, dy) = (x - cx, y - cy);
-        dx * dx + dy * dy <= rr
-    });
-}
-
-/// 圆头线段: 判据是"到线段的距离 ≤ 半宽"
-fn stroke_line(px: &mut [u32], size: usize, a: (f32, f32), b: (f32, f32), width: f32, color: Rgb) {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx * dx + dy * dy;
-    let half2 = (width / 2.0) * (width / 2.0);
-    composite(px, size, color, |x, y| {
-        // 投影到线段并夹到 [0,1], 得到线段上最近的点
-        let t = (((x - a.0) * dx + (y - a.1) * dy) / len2).clamp(0.0, 1.0);
-        let (ex, ey) = (x - (a.0 + t * dx), y - (a.1 + t * dy));
-        ex * ex + ey * ey <= half2
-    });
-}
-
-/// 超采样求每个像素的覆盖率, 按 source-over 合成上去。
-///
-/// 覆盖率直接当 alpha 用, 所以边缘是半透明而不是锯齿 —— 32→16 降采样后差别明显。
-fn composite<F: Fn(f32, f32) -> bool>(px: &mut [u32], size: usize, color: Rgb, inside: F) {
-    let step = 1.0 / ICON_AA as f32;
-    let total = ICON_AA * ICON_AA;
-    for y in 0..size {
-        for x in 0..size {
-            let mut hits = 0u32;
-            for sy in 0..ICON_AA {
-                for sx in 0..ICON_AA {
-                    // 采样点取子格中心, 避免整数边界上的系统性偏移
-                    let fx = x as f32 + (sx as f32 + 0.5) * step;
-                    let fy = y as f32 + (sy as f32 + 0.5) * step;
-                    if inside(fx, fy) {
-                        hits += 1;
-                    }
-                }
-            }
-            if hits == 0 {
-                continue;
-            }
-            let a = (hits * 255 / total) as u8;
-            let i = y * size + x;
-            px[i] = over(premultiply(color, a), px[i]);
-        }
-    }
-}
-
-/// 直通色 + 覆盖率 -> 预乘 alpha 的 BGRA(u32 里是 `A<<24 | R<<16 | G<<8 | B`,
-/// 小端内存序恰好是 B,G,R,A —— 这就是 32bpp DIB 的排布)。
-///
-/// 32bpp 图标的 alpha 按**预乘**解释。不预乘的话半透明边缘会偏亮, 圆周看着发白。
-fn premultiply((r, g, b): Rgb, a: u8) -> u32 {
-    let m = |c: u8| (c as u32 * a as u32 + 127) / 255;
-    (a as u32) << 24 | m(r) << 16 | m(g) << 8 | m(b)
-}
-
-/// 预乘空间里的 source-over: `dst = src + dst * (1 - src_a)`
-fn over(src: u32, dst: u32) -> u32 {
-    let sa = src >> 24;
-    if sa == 255 {
-        return src; // 全覆盖, 常见情形直接短路
-    }
-    let inv = 255 - sa;
-    let ch = |shift: u32| {
-        let s = (src >> shift) & 0xFF;
-        let d = (dst >> shift) & 0xFF;
-        (s + (d * inv + 127) / 255).min(255)
-    };
-    ch(24) << 24 | ch(16) << 16 | ch(8) << 8 | ch(0)
-}
 
 /// 把像素缓冲变成 HICON。掩码位图必须与颜色位图同尺寸 ——
 /// 传 1x1 会让 `CreateIconIndirect` 返回 `E_INVALIDARG`。
@@ -1093,6 +938,9 @@ mod tests {
     use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC, GetDIBits, HDC};
     use windows::Win32::UI::WindowsAndMessaging::GetIconInfo;
 
+    // 纯像素/几何/编码的测试都在 crate::icon 里(纯 std)。这里只测和 windows crate
+    // 绑定的那部分: paint 出来的像素能不能正确变成 HICON 并往返。
+
     const LOOKS: [Look; 5] = [
         Look::Idle,
         Look::System,
@@ -1107,116 +955,13 @@ mod tests {
     fn alpha(p: u32) -> u32 {
         p >> 24
     }
-    /// (r, g, b)
     fn rgb(p: u32) -> (u32, u32, u32) {
         ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF)
     }
 
-    /// **核心回归**: 画出来的像素 alpha 必须非零。
-    ///
-    /// 旧实现用 GDI 的 `Ellipse` / `LineTo` 绘制, 而它们只写 RGB 不碰 alpha,
-    /// 于是整张图 alpha 全零 —— 对 alpha 混合器就是完全透明, 托盘只显示空白。
-    /// tooltip 却照常可见(走 `szTip`, 与图标无关), 所以这个故障看起来像
-    /// "图标丢了"而不是"图标画错了"。
-    #[test]
-    fn painted_pixels_have_nonzero_alpha() {
-        for look in LOOKS {
-            let px = paint_icon(look);
-            assert_eq!(alpha(at(&px, 16, 16)), 255, "{:?} 圆心必须完全不透明", look);
-            let opaque = px.iter().filter(|p| alpha(**p) == 255).count();
-            let visible = px.iter().filter(|p| alpha(**p) > 0).count();
-            assert!(opaque > 200, "{:?} 只有 {} 个不透明像素, 图标会几乎看不见", look, opaque);
-            assert!(visible > 300, "{:?} 可见像素只有 {}", look, visible);
-        }
-    }
-
-    /// 四个角必须透明, 否则图标会变成一个方块
-    #[test]
-    fn corners_stay_transparent() {
-        for look in LOOKS {
-            let px = paint_icon(look);
-            for (x, y) in [(0, 0), (ICON_SIZE - 1, 0), (0, ICON_SIZE - 1), (ICON_SIZE - 1, ICON_SIZE - 1)] {
-                assert_eq!(alpha(at(&px, x, y)), 0, "{:?} 角 ({},{}) 不该有像素", look, x, y);
-            }
-        }
-    }
-
-    /// 预乘不变量: 任何颜色通道都不得超过该像素的 alpha。
-    /// 违反的话半透明边缘会偏亮, 圆周看着发白。
-    #[test]
-    fn premultiplied_invariant_holds() {
-        for look in LOOKS {
-            for (i, p) in paint_icon(look).iter().enumerate() {
-                let a = alpha(*p);
-                let (r, g, b) = rgb(*p);
-                assert!(
-                    r <= a && g <= a && b <= a,
-                    "{:?} 像素 {} 未预乘: 0x{:08X}",
-                    look,
-                    i,
-                    p
-                );
-            }
-        }
-    }
-
-    /// "图标颜色即状态"要求五个外观互不相同 —— 否则托盘上根本区分不出来
-    #[test]
-    fn every_look_is_visually_distinct() {
-        let all: Vec<Vec<u32>> = LOOKS.iter().map(|l| paint_icon(*l)).collect();
-        for i in 0..all.len() {
-            for j in (i + 1)..all.len() {
-                assert_ne!(all[i], all[j], "{:?} 与 {:?} 画出来一样", LOOKS[i], LOOKS[j]);
-            }
-        }
-    }
-
-    /// 绿点必须在**右上**。这条同时钉住 `paint_icon` 的"自上而下"约定 ——
-    /// 约定一改, 拷进 DIB 时的翻转就会反, 绿点跑到右下。
-    ///
-    /// 用"绿色像素的分布"而不是某个镜像点的色值来判定: 缓冲区是**预乘**的,
-    /// 边缘像素的通道值已经被 alpha 缩小过, 直接比原始通道会把抗锯齿边判成别的颜色。
-    /// 而"g 同时大于 r 和 b"这个关系不受预乘影响(同一个 alpha 缩放所有通道)。
-    #[test]
-    fn force_dot_sits_in_the_top_right() {
-        let px = paint_icon(Look::Force);
-        let (r, g, b) = rgb(at(&px, 24, 10));
-        assert_eq!(alpha(at(&px, 24, 10)), 255, "点心应完全不透明");
-        assert!(g > 150 && r < 60 && b < 60, "(24,10) 应是绿点, 得到 r={} g={} b={}", r, g, b);
-
-        let greenish = |x: usize, y: usize| {
-            let p = at(&px, x, y);
-            let (r, g, b) = rgb(p);
-            alpha(p) > 0 && g > r && g > b
-        };
-        let top: usize = (0..ICON_SIZE / 2)
-            .map(|y| (0..ICON_SIZE).filter(|x| greenish(*x, y)).count())
-            .sum();
-        let bottom: usize = (ICON_SIZE / 2..ICON_SIZE)
-            .map(|y| (0..ICON_SIZE).filter(|x| greenish(*x, y)).count())
-            .sum();
-        assert!(top > 30, "上半部分只有 {} 个绿色像素, 绿点没画出来?", top);
-        assert_eq!(bottom, 0, "下半部分出现了 {} 个绿色像素, 上下判定反了", bottom);
-    }
-
-    /// 暂停态的白斜杠必须真的盖在圆心上(线段 (7,25)-(25,7) 的中点正是 (16,16))
-    #[test]
-    fn paused_has_a_white_slash() {
-        let px = paint_icon(Look::Paused);
-        let (r, g, b) = rgb(at(&px, 16, 16));
-        assert!(
-            r > 200 && g > 200 && b > 200,
-            "圆心应被白色斜杠覆盖, 得到 r={} g={} b={}",
-            r,
-            g,
-            b
-        );
-    }
-
-    /// 端到端: 走完 `CreateIconIndirect` 之后, 系统保存的位图里 alpha 必须还在。
-    ///
-    /// 这才是"托盘空白"的真正判据 —— `paint_icon` 正确但拷进 DIB 的那段写错
-    /// (漏了上下翻转、步进算错) 同样前功尽弃, 而纯像素测试看不出来。
+    /// 端到端: 走完 `CreateIconIndirect` 之后, 系统保存的位图里 alpha 必须还在,
+    /// 且方向没反。这才是"托盘空白"的真正判据 —— `icon::paint` 正确但 `make_icon`
+    /// 拷进 DIB 那段写错(漏了上下翻转、步进算错)同样前功尽弃, 纯像素测试看不出来。
     #[test]
     fn icon_round_trip_keeps_alpha_and_orientation() {
         let icon = draw_icon(Look::Force).expect("应能创建图标");
@@ -1228,6 +973,7 @@ mod tests {
         let opaque = px.iter().filter(|p| alpha(**p) == 255).count();
         assert!(opaque > 200, "回读后只有 {} 个不透明像素 -> 托盘会是空白", opaque);
 
+        // 绿点在右上 -> 翻转方向对
         let (r, g, b) = rgb(at(&px, 24, 10));
         assert!(g > 150 && r < 60 && b < 60, "绿点不在右上: r={} g={} b={}", r, g, b);
     }
@@ -1239,28 +985,6 @@ mod tests {
             let icon = draw_icon(look).unwrap_or_else(|| panic!("{:?} 创建失败", look));
             unsafe {
                 let _ = DestroyIcon(icon);
-            }
-        }
-    }
-
-    /// 主体必须是个**居中的圆**: 半径 8 处处处不透明、半径 12 处处处透明。
-    /// 这条挡住"画成方块""圆心偏了""半径算错"这类几何错误 ——
-    /// 只看 alpha 是否非零是看不出来的。
-    #[test]
-    fn body_is_a_centred_disc() {
-        let px = paint_icon(Look::Idle);
-        let c = ICON_SIZE as f32 / 2.0;
-        for y in 0..ICON_SIZE {
-            for x in 0..ICON_SIZE {
-                // 采样点取像素中心, 与光栅化时的约定一致
-                let (dx, dy) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c);
-                let d = (dx * dx + dy * dy).sqrt();
-                let a = alpha(at(&px, x, y));
-                if d <= 8.0 {
-                    assert_eq!(a, 255, "({},{}) 距圆心 {:.1} 应实心, alpha={}", x, y, d, a);
-                } else if d >= 12.0 {
-                    assert_eq!(a, 0, "({},{}) 距圆心 {:.1} 应在圆外, alpha={}", x, y, d, a);
-                }
             }
         }
     }
@@ -1294,7 +1018,7 @@ mod tests {
         assert!(s.contains(crate::engine::policy_label("system")));
     }
 
-    /// 用 `GetDIBits` 把 HICON 的颜色位图读回来, **自上而下**(与 paint_icon 同序)。
+    /// 用 `GetDIBits` 把 HICON 的颜色位图读回来, **自上而下**(与 icon::paint 同序)。
     /// `GetIconInfo` 返回的两个位图归调用方所有, 必须删掉。
     fn read_icon_pixels(icon: HICON) -> Option<Vec<u32>> {
         unsafe {
