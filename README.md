@@ -66,6 +66,7 @@ src/autostart.rs   登录触发的计划任务 XML，失败回退注册表 Run
 src/detect/mod.rs  Detector trait、ProcessTable 快照、CpuTracker、RateMeter
 src/detect/{audio,net,proc,dl,hint}.rs   五个检测器
 plugins/stayawake-hint.js                OpenCode 插件
+plugins/dsh/                             DSH (DeepSeek Harness) 插件 bundle
 ```
 
 **两个线程，都是阻塞等待，空闲时零 CPU：**
@@ -158,6 +159,15 @@ mtime 超过 TTL 自动失效 —— 写方崩溃不会把机器永久卡醒。
 | **node（真正干活的）** | **0.0–0.3%** |
 
 CPU 几乎全被 UI 重绘吃掉，和"是否真在工作"无关。转圈动画 ≠ 在工作。
+
+**DSH (DeepSeek Harness) 用户**：把 `plugins/dsh/` 当成 bundle 装进 DSH 的插件管理
+（插件页里安装 bundle，或让 agent 调 `plugin_manager` 的 `install_bundle`，target 指到这个目录的绝对路径），
+装完由 profile 加载。hint 文件名是 `hints\dsh.hint`；同时开多个 profile 时按 profile 区分成
+`hints\dsh-<profile>.hint`，互不干扰。
+
+覆盖范围和 OpenCode 一样：每个 agent 从 `running` 到回到 `idle` 全程保持唤醒 ——
+模型思考、流式输出、工具执行，以及被派生的**子 agent**（子 agent 同样是 agent，一样发 `agent/status`）。
+多 agent 并发时用引用计数，全部 idle 才释放；agent 被销毁也会释放，不会卡住。
 
 ---
 
@@ -277,6 +287,8 @@ SYSTEM:
 - 网络检测是全机聚合，不区分进程；VPN / 局域网流量同样计入。
 - 一旦已进入 Modern Standby，桌面应用被 DAM 挂起，我们也跑不动 —— 所以整个设计是**提前阻止进入**。
 - **hint 插件只在 OpenCode 启动时加载一次**。改动插件后必须重启 OpenCode。
+- **DSH 插件只看得见 DSH 自己的 agent**。DSH 里不经过 agent 的后台工作（例如你自己在终端跑的脚本）
+  它抓不到 —— 那种情况用上面的 hint 文件手工撑住。
 
 ## 悬而未决
 
@@ -457,7 +469,7 @@ cargo clippy --release --all-targets
 cargo build --release
 .\target\release\stayawake.exe --write-ico installer\stayawake.ico
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\stayawake.iss
-# 产物: dist\stayawake-0.1.1-setup.exe
+# 产物: dist\stayawake-0.1.2-setup.exe
 ```
 
 图标是**从代码生成**的，不是手工维护的资源文件 —— `--write-ico` 复用 `tray.rs`
@@ -467,7 +479,7 @@ cargo build --release
 `stayawake.iss` 必须以 **UTF-8 with BOM** 保存。Inno 6 靠 BOM 判断脚本编码，
 没有 BOM 的话里面所有中文都会变成乱码 —— 编译不报错，但装出来的向导是花的。
 
-改版本号时 `Cargo.toml` 和 `stayawake.iss` 的 `AppVersion` 要一起改。
+改版本号时 `Cargo.toml` 和 `stayawake.iss` 的 `AppVersion` 要一起改（`Cargo.lock` 由 cargo 自动同步）。
 `AppId` 那个 GUID **永远不要动**，它是升级识别的唯一依据，改了会变成并列装两份。
 
 <details>

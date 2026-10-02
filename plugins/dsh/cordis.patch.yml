@@ -1,0 +1,4 @@
+# stayawake 的 DSH 插件行。patch 语义: 只有 insert 能新增条目。
+- insert:
+    - id: stayawake-hint
+      name: 'stayawake-dsh-hint'

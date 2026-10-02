@@ -1,0 +1,11 @@
+{
+  "name": "stayawake-dsh-hint",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "description": "DSH (DeepSeek Harness) 适配: 会话忙碌期间保持 stayawake 的 hint 文件新鲜",
+  "exports": { ".": "./index.js" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" }
+  }
+}
