@@ -1,11 +1,19 @@
 {
-  "name": "stayawake-dsh-hint",
-  "version": "0.1.2",
+  "name": "@local/dsh-stayawake-hint",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "DSH (DeepSeek Harness) 适配: 会话忙碌期间保持 stayawake 的 hint 文件新鲜",
-  "exports": { ".": "./index.js" },
+  "main": "lib/index.js",
+  "description": "Host-plane dsh plugin: maintain %LOCALAPPDATA%/stayawake/hints/dsh-agent.hint while any session agent runs, so stayawake can hold sleep suppression for DeepSeek Harness",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" }
-  }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
 }

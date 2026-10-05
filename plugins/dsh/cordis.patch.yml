@@ -1,4 +1,6 @@
-# stayawake 的 DSH 插件行。patch 语义: 只有 insert 能新增条目。
+# dsh-stayawake-hint bundle patch: one host-plane plugin row.
+# Mounted after the web-app bundle layer; the row joins the Loader entry list,
+# so lib/index.js runs in the Host process where agent/status reaches it.
 - insert:
-    - id: stayawake-hint
-      name: 'stayawake-dsh-hint'
+    - id: dsh-stayawake-hint
+      name: '@local/dsh-stayawake-hint'
