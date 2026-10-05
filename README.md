@@ -9,11 +9,13 @@
 Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在下载」「Agent 在跑任务」，
 于是这些场景下机器照样熄屏休眠。stayawake 补上这一层判断。
 
-- 单个原生 exe，**420 KB**（含内嵌图标），无运行时依赖
+- 单个原生 exe，**476 KB**（含内嵌图标），无运行时依赖
 - 实测常驻开销：**私有内存 2.4 MB，CPU 0.14%/单核**（20 核机器上约占总算力 0.007%）
 - 检测延迟 **2 秒**（廉价探测走快速通道，完整检测仍是 15 秒一轮）
 - 对游戏无影响：EcoQoS 丢到 E-core、BelowNormal 优先级、**绝不调 `timeBeginPeriod`**
-- 119 个单元测试
+- 托盘菜单两套外观可选：系统原生，或**零依赖自绘的圆角现代菜单**
+- 内置**在线更新检测**（只提示、只代下载，绝不静默替换 exe）
+- 160 个单元测试
 
 ---
 
@@ -37,7 +39,7 @@ Windows 自带的空闲判定只认键鼠输入，不认「在放音乐」「在
 
 ```powershell
 cargo build --release
-cargo test --release          # 119 个单元测试
+cargo test --release          # 160 个单元测试
 
 # 看一眼各检测器读数（不常驻，调阈值用）
 .\target\release\stayawake.exe --status
@@ -62,6 +64,8 @@ src/power.rs       SetThreadExecutionState / AC-DC / 主动睡眠 / 本地时间
 src/config.rs      配置解析（非法值留痕）、旧版自动补齐新键、原子回写（保留注释）
 src/log.rs         状态跃变日志，1 MB 轮转，跨进程串行化
 src/tray.rs        托盘图标（自己光栅化，预乘 alpha）、菜单、显示器状态通知
+src/menu.rs        自绘现代菜单（纯逻辑布局/命中测试 + 薄 Win32 外壳）
+src/update.rs      GitHub Releases 版本检测、提示、下载（零新依赖：WinHTTP + urlmon）
 src/autostart.rs   登录触发的计划任务 XML，失败回退注册表 Run
 src/detect/mod.rs  Detector trait、ProcessTable 快照、CpuTracker、RateMeter
 src/detect/{audio,net,proc,dl,hint}.rs   五个检测器
@@ -160,14 +164,34 @@ mtime 超过 TTL 自动失效 —— 写方崩溃不会把机器永久卡醒。
 
 CPU 几乎全被 UI 重绘吃掉，和"是否真在工作"无关。转圈动画 ≠ 在工作。
 
-**DSH (DeepSeek Harness) 用户**：把 `plugins/dsh/` 当成 bundle 装进 DSH 的插件管理
-（插件页里安装 bundle，或让 agent 调 `plugin_manager` 的 `install_bundle`，target 指到这个目录的绝对路径），
-装完由 profile 加载。hint 文件名是 `hints\dsh.hint`；同时开多个 profile 时按 profile 区分成
-`hints\dsh-<profile>.hint`，互不干扰。
+**DSH (DeepSeek Harness) 用户**：`plugins/dsh/` 是个 **host 平面插件 bundle** ——
+没有 UI、没有 npm 依赖、不需要构建，装进 profile 就完事。实测装通的步骤
+（`<profile>` 指 `%USERPROFILE%\.dsh\profiles\<名字>`）：
+
+1. 把 `plugins/dsh/` 整个复制成 `<profile>\stayawake-hint\`
+2. `<profile>\package.json`：`dependencies` 里加 `"@local/dsh-stayawake-hint": "file:stayawake-hint"`，
+   `dsh.profile.bundles` 末尾加 `"@local/dsh-stayawake-hint"`
+3. 让 `<profile>\node_modules\@local\dsh-stayawake-hint` 指向第 1 步那个目录（目录 junction 即可）
+4. **重启 DSH** —— bundle 只在启动时装配一次
+
+hint 文件名是 `hints\dsh-agent.hint`：忙碌期间每 20 秒刷新一次 mtime，全部空闲后就不再刷新，
+让 mtime 自然超出 TTL（60 秒）而失效 —— 插件崩了也不会把机器永久卡醒。
+多个 profile 同时跑时共用一个文件名，其中一个在忙就会整体保持唤醒（偏保守，不会漏）。
 
 覆盖范围和 OpenCode 一样：每个 agent 从 `running` 到回到 `idle` 全程保持唤醒 ——
 模型思考、流式输出、工具执行，以及被派生的**子 agent**（子 agent 同样是 agent，一样发 `agent/status`）。
-多 agent 并发时用引用计数，全部 idle 才释放；agent 被销毁也会释放，不会卡住。
+判忙看三处：`agents.list()` 里 `status === "running"`、agent 的 `inbox` 里还压着 turn/step、
+以及有 `running` / `stopping` 的后台 job。
+
+> **监听必须带 `{ global: true }`**：`ctx.on("agent/status", fn, { global: true })`。
+> 插件跑在 Host 进程、不在某个 agent 的上下文里，不带这个选项收不到别的 agent 发的事件。
+> 定时刷新那条路径同样不能省 —— 模型长时间思考时一次状态跃变都没有，只有 20 秒的
+> interval 在撑 mtime。
+
+> 0.1.2 发布过一版 `stayawake-dsh-hint`（按 profile 区分文件名、全 idle 时删文件）。
+> 它在本机始终没真正装起来（profile 的 `bundles` 和 `node_modules` 里都没有它），
+> 所以 0.1.3 起 `plugins/dsh/` 换成上面这份**实际装上并验证过**的实现；
+> 旧版留在 git 历史里（`git show v0.1.2:plugins/dsh/index.js`）。
 
 ---
 
@@ -198,6 +222,62 @@ policy_dc = display    # 电池: 保持屏幕
 菜单**支持连续操作**：切模式、开关检测器、改策略、开机自启这些项点完菜单不收起也不闪，
 勾选状态就地更新，可以一次右键连点好几个。只有「当前状态详情 / 打开日志 / 打开配置文件 / 退出」
 会收起（这些本来就要把焦点交给别的窗口）。点菜单外部、切到别的程序或按 Esc 收起。
+
+### 两套菜单外观
+
+```ini
+menu_style = modern    # modern = 自绘现代菜单(默认); system = Windows 原生菜单(兜底)
+menu_theme = auto      # auto / light / dark —— 只对 modern 生效
+```
+
+**默认就是 `modern`**：这次改动的目的就是让它看起来现代，默认走系统菜单等于没改。
+`system` 是永久保留的兜底，任何时候都能切回去。而且自绘这条路上还叠了两层保护：建窗失败时
+自动回落到系统菜单（宁可这次不好看，也不能没有菜单），显式写了 `menu_style = system` 的配置
+在任何版本里都不会被改写。
+
+`modern` 长这样：顶上一张状态卡（供电 / 模式 / 更新三个彩色圆点 + 当前状态 + 可选的
+「更新可用 vX.Y.Z」角标），下面是**按功能分组的二级菜单** —— 模式 / 检测条件 / 电源与启动 / 更多，
+点一下就地展开（手风琴），不是那种要横着再飞出去的级联子菜单。
+
+> 子菜单做成就地展开是有意的：一个窗口只有一条绘制路径、一次命中测试，没有子弹出的生命周期、
+> hover 桥接、失焦收起这些坑，展开状态也就成了可以纯函数测试的数据。22 行平铺因此收成 10 行顶层。
+
+实现上一个新依赖都没加（仍然只有 `windows` crate）。框架（egui / Slint / nwg）恰恰帮不上真正的难点
+—— DWM 圆角、命中测试、弹出生命周期、逐项 hover，它们都不做，却要付出几 MB 体积和常驻内存；
+而菜单是瞬时 UI，不该为它付全天的内存。体积代价实测：自绘菜单和在线更新两块新功能合起来
+把 exe 从 420 KB 带到 476 KB（净增 56 KB），一个依赖都没多。
+
+深色/浅色的 `auto` 读 `HKCU\...\Themes\Personalize\AppsUseLightTheme`；DPI 用
+`GetDpiForWindow` 逐显示器缩放（进程是 per-monitor-v2 感知的，否则会被系统拉伸成糊的）。
+
+### 在线更新
+
+启动 5 秒后查一次 GitHub Releases，之后每 `update_interval_hours` 查一次。
+有新版本时托盘图标右下角多一个红点，菜单顶部多一行「发现新版本 x.y.z」，点它有
+**「下载安装包」和「打开下载页」**两个出口。
+
+不给静默替换 exe 这件事做自动化：换掉正在运行的自己需要处理占用、回滚、校验，
+一个 0.4 MB 的工具不值得为它背这个风险。下载完成后只是提示你点一下运行安装包。
+
+三个刻意的取舍：
+
+- **只查不装** —— 权限、路径、回滚都不在自己手里，凭据也不碰
+- **零新依赖** —— 手写 JSON 扫描 + WinHTTP 查版本（GitHub API 不带 User-Agent 会 403）+ urlmon 下载
+  （GitHub 的 asset 是 302 跳转，urlmon 原生跟随，WinHTTP 得自己解析 Location）。
+  引入 reqwest + serde 会把 exe 推到 2 MB 以上，而体积正是这个项目的卖点
+- **失败无声** —— 离线、代理不通、GitHub 抽风一律只写日志，绝不弹框、绝不阻塞托盘主循环
+
+**匿名配额是按出口 IP 算的。** GitHub 只给匿名请求 60 次/小时，而挂代理时那个 IP 是
+代理机房的、和别人共用，配额可能被别人用光 —— 日志里会出现
+
+```
+update: 被 GitHub 限流(匿名配额按出口 IP 算, 走代理时是机房共用 IP), 600 秒后再试:
+HTTP 403: {"message":"API rate limit exceeded for 103.62.49.170. ...
+```
+
+这种情况**不是**"查不到新版本"，而是"这一刻查不了"，所以它不按 `update_interval_hours`
+等满 24 小时，而是 600 秒后重试一次，直到配额让位。其他失败（离线、代理没开）重试也没用，
+仍按正常周期。
 
 > 实现上装一个线程级 `WH_MOUSE` 钩子。点在"可连续操作"的项上时钩子就地执行命令、
 > 用 `CheckMenuItem` + `SetMenuItemInfoW` 改勾选和标题、`RedrawWindow` 重绘，
@@ -238,7 +318,7 @@ $h = [T.W]::FindWindowW("stayawake_msgwnd","stayawake")
 
 ## 已验证
 
-**119 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
+**160 个单元测试**，`cargo test --release` 全绿。覆盖的都是"改一处坏一处"风险最高的纯逻辑：
 
 | 模块 | 测试重点 |
 |---|---|
@@ -252,6 +332,8 @@ $h = [T.W]::FindWindowW("stayawake_msgwnd","stayawake")
 | `main` | Force 截止时刻夹取休眠时长（向上取整、过期不忙等）、**生成的 .ico 必须能被 `LoadImageW` 在四个尺寸下加载**、PNG/zlib 校验和的已知答案、预乘反乘 |
 | `power` | `apply_hold` 返回值语义（首次调用即成功） |
 | `tray` | **画出的像素 alpha 必须非零**（否则托盘全透明）、预乘不变量、圆的几何、绿点在右上（钉住行序约定）、`CreateIconIndirect` 往返后 alpha 仍在、三行状态块的切分 |
+| `menu` | 主题 `auto` 跟随系统深浅色、展开子菜单后布局变高但**宽度不变**（否则展开会横向跳）、命中测试逐行对齐目标、卡片/分组标题不可点、键盘上下键回绕、越界时菜单位置翻转并夹紧工作区、超宽标签截断成省略号 |
+| `update` | 版本号数值比较（不是字典序）、稳定通道跳过 prerelease、**绝不提示降级**、畸形 JSON 不 panic |
 | `autostart` | 计划任务 XML 的三个坑全部关闭、路径转义、UTF-16 BOM |
 
 真机验证（提权 `powercfg /requests` 是唯一真值来源）：
@@ -428,6 +510,13 @@ dl_io_kbps   = 50
 dl_tcp_conns = 4
 hint_enabled  = true
 hint_ttl_secs = 60
+
+menu_style = modern        # modern = 自绘现代菜单(默认); system = 原生菜单
+menu_theme = auto          # auto / light / dark (只对 modern 生效)
+
+update_enabled         = true
+update_interval_hours  = 24   # 0 = 只在启动时查一次
+update_channel         = stable  # stable / beta
 ```
 
 升级版本后旧配置缺失的新键会被**自动追加**（带注释），已有值不动。
@@ -445,7 +534,7 @@ hint_ttl_secs = 60
 
 ```powershell
 cargo build --release   # 产物: target\release\stayawake.exe
-cargo test --release    # 119 个单元测试
+cargo test --release    # 160 个单元测试
 cargo clippy --release --all-targets
 ```
 
@@ -469,7 +558,7 @@ cargo clippy --release --all-targets
 cargo build --release
 .\target\release\stayawake.exe --write-ico installer\stayawake.ico
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\stayawake.iss
-# 产物: dist\stayawake-0.1.2-setup.exe
+# 产物: dist\stayawake-0.1.3-setup.exe
 ```
 
 图标是**从代码生成**的，不是手工维护的资源文件 —— `--write-ico` 复用 `tray.rs`

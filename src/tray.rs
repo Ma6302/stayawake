@@ -25,14 +25,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CheckMenuItem, CreateIconIndirect, CreatePopupMenu,
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, GetCursorPos,
-    FindWindowExW, GetMenuItemID, GetMessageW, LoadCursorW, MenuItemFromPoint,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW, GetClassNameW,
+    GetCursorPos, FindWindowExW, GetMenuItemID, GetMessageW, IsWindow, LoadCursorW,
+    MenuItemFromPoint,
     MN_GETHMENU, SendMessageW, WindowFromPoint, MessageBoxW, PostQuitMessage,
     RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetMenuItemInfoW,
     SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, CW_USEDEFAULT,
     DEVICE_NOTIFY_WINDOW_HANDLE, HC_ACTION, HHOOK, HICON, HMENU, ICONINFO, IDC_ARROW,
     MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MENUITEMINFOW, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MIIM_STRING, MOUSEHOOKSTRUCT, MSG,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MIIM_STRING, MOUSEHOOKSTRUCT, MSG,
     PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC, PBT_POWERSETTINGCHANGE, TPM_LEFTALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_MOUSE, WINDOW_STYLE, WM_APP, WM_COMMAND,
     WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
@@ -58,6 +59,8 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 const ID_TITLE: usize = 100;
 const ID_TITLE_STATE: usize = 101;
 const ID_TITLE_WHY: usize = 102;
+/// 第四行: "模式: 自动 · 检测条件: 3/5"。分组之后顶层的可读性补偿
+const ID_TITLE_MODE: usize = 103;
 const ID_AUTO: usize = 110;
 const ID_PAUSE: usize = 111;
 const ID_FORCE_30M: usize = 120;
@@ -79,6 +82,19 @@ const ID_OPEN_CFG: usize = 151;
 const ID_RELOAD: usize = 152;
 const ID_DETAILS: usize = 153;
 const ID_EXIT: usize = 160;
+
+// 在线更新。170 段留出来, 以后加"跳过此版本"之类不用重排。
+/// 顶部那行"更新可用 vX.Y.Z", 只有真有更新(或正在下载/已下载)时才出现。
+/// 点它 = 下载; 已下载则直接安装。
+const ID_UPDATE_NOTICE: usize = 170;
+/// 立即查一次, 不等定时器
+const ID_UPDATE_CHECK: usize = 171;
+/// 打开 GitHub releases 页面
+const ID_UPDATE_PAGE: usize = 172;
+
+// 二级菜单的父项没有命令 ID: MF_POPUP 项的 wID 字段被系统拿去存子菜单句柄,
+// 所以点父项时 GetMenuItemID 返回 (UINT)-1, TrackPopupMenu 也永远不会返回它。
+// 父项文案只能静态写死, 状态摘要改走顶层那几行标题(见 mode_summary/detect_summary)。
 
 pub fn run(shared: Arc<Shared>, hwnd_tx: mpsc::Sender<HWND>) {
     let _ = SHARED.set(shared);
@@ -118,6 +134,9 @@ pub fn run(shared: Arc<Shared>, hwnd_tx: mpsc::Sender<HWND>) {
             None,
         );
         let _ = hwnd_tx.send(hwnd);
+
+        // 更新线程要拿这个句柄才能在查完之后敲一下 UI(否则菜单里那行要等下次打开才变)
+        crate::update::set_owner(hwnd);
 
         // 跟踪显示器真实开关状态。
         // 注意 flags 必须是 DEVICE_NOTIFY_WINDOW_HANDLE(=0); 误传 2(DEVICE_NOTIFY_CALLBACK)
@@ -244,7 +263,7 @@ fn add_icon(hwnd: HWND) {
     notify(hwnd, NIM_ADD);
 }
 
-fn refresh_icon(hwnd: HWND) {
+pub(crate) fn refresh_icon(hwnd: HWND) {
     notify(hwnd, NIM_MODIFY);
 }
 
@@ -275,8 +294,15 @@ fn remove_icon(hwnd: HWND) {
 
 /// 颜色即状态: 灰=空闲, 琥珀=仅防睡, 蓝=保持屏幕, 蓝+绿点=强制常亮, 红+斜杠=暂停。
 /// 像素怎么画在 `crate::icon`(纯 std, 与 build.rs 共用), 这里只负责包成 HICON。
+///
+/// 有新版本时再叠一个右下角红点(见 `icon::paint_with_badge`)。用 `paint` 而不是
+/// `paint_with_badge(...,false)`: 后者多走一遍空分支, 而托盘图标每次状态变化都要重画。
 fn draw_icon(look: Look) -> Option<HICON> {
-    make_icon(&icon::paint(look, ICON_SIZE))
+    if crate::update::has_update() {
+        make_icon(&icon::paint_with_badge(look, ICON_SIZE, true))
+    } else {
+        make_icon(&icon::paint(look, ICON_SIZE))
+    }
 }
 
 /// 图标边长。托盘实际只要 16x16(100% DPI), 给 32x32 让 shell 降采样 ——
@@ -359,13 +385,29 @@ fn make_icon(px: &[u32]) -> Option<HICON> {
 
 /// 选中该项后菜单是否保持打开。
 /// 只有"会把焦点交出去"的项才关闭 —— 其余(模式、各种开关)可以连续点。
-fn keeps_menu_open(id: usize) -> bool {
-    !matches!(id, ID_EXIT | ID_OPEN_LOG | ID_OPEN_CFG | ID_DETAILS)
+pub(crate) fn keeps_menu_open(id: usize) -> bool {
+    // 例外里的每一项都是"点完要立刻把注意力交出去"的动作: 弹窗/开编辑器/开日志。
+    // 「检查更新」和「下载安装包」反过来要留在菜单里 —— 菜单行本身就是进度显示,
+    // 当场把文案改成"正在检查更新..."/"正在下载..."比关掉菜单再弹个框安静得多。
+    !matches!(
+        id,
+        ID_EXIT | ID_OPEN_LOG | ID_OPEN_CFG | ID_DETAILS | ID_UPDATE_PAGE
+    )
 }
 
 /// 菜单打开期间的上下文, 供鼠标钩子就地更新用
 static MENU_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static MENU_WINDOW: AtomicIsize = AtomicIsize::new(0);
+/// 最近一次鼠标落到菜单上时光标底下的那个菜单窗口。可能是子菜单窗口 ——
+/// 子菜单是独立窗口, 顶层窗口重绘不到它。
+static MENU_POINT_WINDOW: AtomicIsize = AtomicIsize::new(0);
+/// 三个子菜单的句柄: [模式, 检测条件, 电源与启动]。
+/// `CheckMenuItem` / `SetMenuItemInfo` 只在自己那一层里找项, 拿顶层句柄
+/// 去改子菜单里的勾是静默无效的 —— 必须留句柄, 分别对着改。
+static MENU_SUB: [AtomicIsize; 3] = [AtomicIsize::new(0), AtomicIsize::new(0), AtomicIsize::new(0)];
+const SUB_MODE: usize = 0;
+const SUB_DETECT: usize = 1;
+const SUB_POWER: usize = 2;
 /// 上次选的是哪个"强制常亮"时长, 用于把勾画在正确的那一项上
 static FORCE_PICK: AtomicUsize = AtomicUsize::new(0);
 /// autostart 查询要跑 schtasks + reg 两个子进程(数百 ms), 绝不能在
@@ -404,7 +446,21 @@ fn menu_title_lines() -> [String; 3] {
 
 /// 这三行是纯展示, 点击不该做任何事
 fn is_title(id: usize) -> bool {
-    matches!(id, ID_TITLE | ID_TITLE_STATE | ID_TITLE_WHY)
+    matches!(id, ID_TITLE | ID_TITLE_STATE | ID_TITLE_WHY | ID_TITLE_MODE)
+}
+
+/// "检测条件: 3/5 项开启"。数目比勾更重要 —— 关掉全部检测器等于这个程序白装,
+/// 而顶层菜单是唯一一个用户一定会看到的地方。
+fn detect_summary(cfg: &Config) -> String {
+    let flags = [
+        cfg.audio_enabled,
+        cfg.net_enabled,
+        cfg.proc_enabled,
+        cfg.dl_enabled,
+        cfg.hint_enabled,
+    ];
+    let on = flags.iter().filter(|b| **b).count();
+    format!("检测条件: {on}/{}", flags.len())
 }
 
 fn build_menu() -> HMENU {
@@ -426,50 +482,111 @@ fn build_menu() -> HMENU {
         let power_w = wide(&t_power);
         let state_w = wide(&t_state);
         let why_w = wide(&t_why);
+        let summary_w = wide(&format!("{} · {}", mode_summary(mode), detect_summary(&cfg)));
         let display_w = wide(&label_display);
         let system_w = wide(&label_system);
 
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE, PCWSTR(power_w.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE_STATE, PCWSTR(state_w.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE_WHY, PCWSTR(why_w.as_ptr()));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // 第四行把"模式 + 开了几项检测"摊在顶层。开关收进二级菜单之后,
+        // 顶层必须还能一眼看出自己是醒着还是强制常亮。
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_TITLE_MODE, PCWSTR(summary_w.as_ptr()));
 
-        let _ = AppendMenuW(menu, MF_STRING | check(mode == Mode::Auto), ID_AUTO, w!("自动 (按活动检测)"));
-        let _ = AppendMenuW(menu, MF_STRING | check(mode == Mode::Paused), ID_PAUSE, w!("暂停 (允许正常休眠)"));
-        for (id, label) in FORCE_ITEMS {
-            let on = forced && force_pick == id;
-            let _ = AppendMenuW(menu, MF_STRING | check(on), id, label);
+        // "有更新"这一行紧贴状态块: 它是整份菜单里唯一一条"需要你动手"的信息,
+        // 掉到底部就等于没有。没有更新时这一行根本不出现。
+        if let Some(text) = crate::update::menu_status() {
+            let w = wide(&text);
+            let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE_NOTICE, PCWSTR(w.as_ptr()));
         }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        let _ = AppendMenuW(menu, MF_STRING | check(cfg.audio_enabled), ID_DET_AUDIO, w!("检测: 音频播放"));
-        let _ = AppendMenuW(menu, MF_STRING | check(cfg.net_enabled), ID_DET_NET, w!("检测: 网络速率"));
-        let _ = AppendMenuW(menu, MF_STRING | check(cfg.proc_enabled), ID_DET_PROC, w!("检测: 进程 CPU"));
-        let _ = AppendMenuW(menu, MF_STRING | check(cfg.dl_enabled), ID_DET_DL, w!("检测: 下载器"));
-        let _ = AppendMenuW(menu, MF_STRING | check(cfg.hint_enabled), ID_DET_HINT, w!("检测: 外部提示文件"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        // ── 模式 ▸ ──
+        // 父项文案是静态的: MF_POPUP 项的 wID 被系统拿去存子菜单句柄,
+        // 想按命令 ID 改它的文字就得拿句柄当 ID 传, 太脆。状态放在上面那行。
+        let sub_mode = CreatePopupMenu().expect("CreatePopupMenu");
+        let _ = AppendMenuW(sub_mode, MF_STRING | check(mode == Mode::Auto), ID_AUTO, w!("自动 (按活动检测)"));
+        let _ = AppendMenuW(sub_mode, MF_STRING | check(mode == Mode::Paused), ID_PAUSE, w!("暂停 (允许正常休眠)"));
+        let _ = AppendMenuW(sub_mode, MF_SEPARATOR, 0, PCWSTR::null());
+        for (id, label) in FORCE_ITEMS {
+            let on = forced && force_pick == id;
+            let lw = wide(label);
+            let _ = AppendMenuW(sub_mode, MF_STRING | check(on), id, PCWSTR(lw.as_ptr()));
+        }
+        let _ = AppendMenuW(menu, MF_POPUP | MF_STRING, sub_mode.0 as usize, w!("模式"));
 
-        let _ = AppendMenuW(menu, MF_STRING | check(policy_is_display), ID_POLICY_DISPLAY, PCWSTR(display_w.as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING | check(!policy_is_display), ID_POLICY_SYSTEM, PCWSTR(system_w.as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING | check(autostart_installed()), ID_AUTOSTART, w!("开机自启"));
+        // ── 检测条件 ▸ ──
+        let sub_det = CreatePopupMenu().expect("CreatePopupMenu");
+        let _ = AppendMenuW(sub_det, MF_STRING | check(cfg.audio_enabled), ID_DET_AUDIO, w!("音频播放"));
+        let _ = AppendMenuW(sub_det, MF_STRING | check(cfg.net_enabled), ID_DET_NET, w!("网络速率"));
+        let _ = AppendMenuW(sub_det, MF_STRING | check(cfg.proc_enabled), ID_DET_PROC, w!("进程 CPU"));
+        let _ = AppendMenuW(sub_det, MF_STRING | check(cfg.dl_enabled), ID_DET_DL, w!("下载器"));
+        let _ = AppendMenuW(sub_det, MF_STRING | check(cfg.hint_enabled), ID_DET_HINT, w!("外部提示文件"));
+        let _ = AppendMenuW(menu, MF_POPUP | MF_STRING, sub_det.0 as usize, w!("检测条件"));
+
+        // ── 电源与启动 ▸ ──
+        let sub_power = CreatePopupMenu().expect("CreatePopupMenu");
+        let _ = AppendMenuW(sub_power, MF_STRING | check(policy_is_display), ID_POLICY_DISPLAY, PCWSTR(display_w.as_ptr()));
+        let _ = AppendMenuW(sub_power, MF_STRING | check(!policy_is_display), ID_POLICY_SYSTEM, PCWSTR(system_w.as_ptr()));
+        let _ = AppendMenuW(sub_power, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(sub_power, MF_STRING | check(autostart_installed()), ID_AUTOSTART, w!("开机自启"));
+        let _ = AppendMenuW(menu, MF_POPUP | MF_STRING, sub_power.0 as usize, w!("电源与启动"));
+
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         let _ = AppendMenuW(menu, MF_STRING, ID_DETAILS, w!("当前状态详情..."));
-        let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_LOG, w!("打开日志"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_OPEN_CFG, w!("打开配置文件"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, w!("重新加载配置"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE_CHECK, if crate::update::checking() { w!("正在检查更新...") } else { w!("检查更新") });
+
+        // ── 更多 ▸ ──
+        let sub_more = CreatePopupMenu().expect("CreatePopupMenu");
+        let _ = AppendMenuW(sub_more, MF_STRING, ID_OPEN_LOG, w!("打开日志"));
+        let _ = AppendMenuW(sub_more, MF_STRING, ID_OPEN_CFG, w!("打开配置文件"));
+        let _ = AppendMenuW(sub_more, MF_STRING, ID_RELOAD, w!("重新加载配置"));
+        let _ = AppendMenuW(sub_more, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(sub_more, MF_STRING, ID_UPDATE_PAGE, w!("打开下载页"));
+        let _ = AppendMenuW(menu, MF_POPUP | MF_STRING, sub_more.0 as usize, w!("更多"));
+
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("退出"));
+
+        // 顶层菜单之外的三个子菜单句柄存下来: CheckMenuItem / SetMenuItemInfo
+        // 都只在自己那一层找项, 传顶层句柄改不动子菜单里的勾。
+        MENU_SUB[0].store(sub_mode.0, Ordering::SeqCst);
+        MENU_SUB[1].store(sub_det.0, Ordering::SeqCst);
+        MENU_SUB[2].store(sub_power.0, Ordering::SeqCst);
         menu
     }
 }
 
-const FORCE_ITEMS: [(usize, PCWSTR); 4] = [
-    (ID_FORCE_30M, w!("强制常亮 · 30 分钟")),
-    (ID_FORCE_1H, w!("强制常亮 · 1 小时")),
-    (ID_FORCE_3H, w!("强制常亮 · 3 小时")),
-    (ID_FORCE_INF, w!("强制常亮 · 直到手动关闭")),
+/// 存文案而不是 PCWSTR: 模式子菜单的标题要复用这几条文案做摘要
+/// (见 `mode_summary`), 而 PCWSTR 读不回 &str。
+const FORCE_ITEMS: [(usize, &str); 4] = [
+    (ID_FORCE_30M, "强制常亮 · 30 分钟"),
+    (ID_FORCE_1H, "强制常亮 · 1 小时"),
+    (ID_FORCE_3H, "强制常亮 · 3 小时"),
+    (ID_FORCE_INF, "强制常亮 · 直到手动关闭"),
 ];
+
+/// 子菜单标题上的状态摘要。
+///
+/// 把开关收进二级菜单之后, 顶层必须还能一眼看出"现在是哪个模式、开了几项检测",
+/// 否则用户得点开才知道自己是不是还挂着强制常亮 —— 那比菜单长更糟。
+fn mode_summary(mode: Mode) -> String {
+    match mode {
+        Mode::Auto => "模式: 自动".into(),
+        Mode::Paused => "模式: 暂停".into(),
+        Mode::Force(_) => {
+            let pick = FORCE_PICK.load(Ordering::SeqCst);
+            let label = FORCE_ITEMS
+                .iter()
+                .find(|(id, _)| *id == pick)
+                .map(|(_, s)| *s)
+                // 强制常亮是别的进程/命令行设的, FORCE_PICK 没跟上
+                .unwrap_or("强制常亮");
+            format!("模式: {label}")
+        }
+    }
+}
 
 /// 找到承载指定 HMENU 的那个 `#32768` 菜单窗口。
 /// 菜单窗口不是 owner 的子窗口, 只能全局遍历顶层窗口, 用 MN_GETHMENU 问它挂的是哪个菜单。
@@ -491,6 +608,30 @@ fn find_menu_window(menu: HMENU) -> Option<HWND> {
     }
 }
 
+/// 这个窗口是不是菜单窗口(class `#32768`)。
+/// WindowFromPoint 可能拿到别的应用的窗口 —— 往那种句柄上发消息/重绘是纯粹的干扰,
+/// 所以先认类名再决定要不要记住它。
+fn is_menu_window(hwnd: HWND) -> bool {
+    unsafe {
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, &mut buf).clamp(0, buf.len() as i32) as usize;
+        String::from_utf16_lossy(&buf[..n]) == "#32768"
+    }
+}
+
+/// 光标底下那个菜单窗口挂着的 HMENU。
+/// 子菜单有自己的 HMENU, 命中测试必须在它自己那一层做 —— 不要猜, 直接问窗口。
+/// 拿不到就退回顶层菜单: 最坏情况等于系统原生行为, 不会更糟。
+fn menu_under_point(mw: HWND, fallback: HMENU) -> (HMENU, isize) {
+    if mw.0 != 0 {
+        let hm = unsafe { SendMessageW(mw, MN_GETHMENU, WPARAM(0), LPARAM(0)) };
+        if hm.0 != 0 {
+            return (HMENU(hm.0), mw.0);
+        }
+    }
+    (fallback, 0)
+}
+
 /// 就地刷新已显示菜单的勾选与标题, 不销毁不重建 —— 所以不会闪。
 /// Windows 不会因为 CheckMenuItem 自动重绘, 必须显式 RedrawWindow。
 fn sync_menu_state() {
@@ -506,26 +647,38 @@ fn sync_menu_state() {
     let ac = current_ac();
     let policy_is_display = if ac { &cfg.policy_ac } else { &cfg.policy_dc } == "display";
 
-    unsafe {
-        let set = |id: usize, on: bool| {
-            let flag = MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED };
-            CheckMenuItem(menu, id as u32, flag.0);
-        };
-        set(ID_AUTO, mode == Mode::Auto);
-        set(ID_PAUSE, mode == Mode::Paused);
-        for (id, _) in FORCE_ITEMS {
-            set(id, forced && force_pick == id);
+    // 子菜单是独立 HMENU: 勾和文字都必须在子菜单那一层改。
+    // 句柄为 0 时退回顶层 —— 最坏结果只是子菜单里的勾不跟着变, 不会崩。
+    let sub_of = |i: usize| {
+        let h = MENU_SUB[i].load(Ordering::SeqCst);
+        if h == 0 {
+            menu
+        } else {
+            HMENU(h)
         }
-        set(ID_DET_AUDIO, cfg.audio_enabled);
-        set(ID_DET_NET, cfg.net_enabled);
-        set(ID_DET_PROC, cfg.proc_enabled);
-        set(ID_DET_DL, cfg.dl_enabled);
-        set(ID_DET_HINT, cfg.hint_enabled);
-        set(ID_POLICY_DISPLAY, policy_is_display);
-        set(ID_POLICY_SYSTEM, !policy_is_display);
-        set(ID_AUTOSTART, autostart_installed());
+    };
+    let (m_mode, m_det, m_power) = (sub_of(SUB_MODE), sub_of(SUB_DETECT), sub_of(SUB_POWER));
 
-        let set_text = |id: usize, s: &str| {
+    unsafe {
+        let set = |m: HMENU, id: usize, on: bool| {
+            let flag = MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED };
+            CheckMenuItem(m, id as u32, flag.0);
+        };
+        set(m_mode, ID_AUTO, mode == Mode::Auto);
+        set(m_mode, ID_PAUSE, mode == Mode::Paused);
+        for (id, _) in FORCE_ITEMS {
+            set(m_mode, id, forced && force_pick == id);
+        }
+        set(m_det, ID_DET_AUDIO, cfg.audio_enabled);
+        set(m_det, ID_DET_NET, cfg.net_enabled);
+        set(m_det, ID_DET_PROC, cfg.proc_enabled);
+        set(m_det, ID_DET_DL, cfg.dl_enabled);
+        set(m_det, ID_DET_HINT, cfg.hint_enabled);
+        set(m_power, ID_POLICY_DISPLAY, policy_is_display);
+        set(m_power, ID_POLICY_SYSTEM, !policy_is_display);
+        set(m_power, ID_AUTOSTART, autostart_installed());
+
+        let set_text = |m: HMENU, id: usize, s: &str| {
             let mut w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
             let mii = MENUITEMINFOW {
                 cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
@@ -533,18 +686,38 @@ fn sync_menu_state() {
                 dwTypeData: PWSTR(w.as_mut_ptr()),
                 ..Default::default()
             };
-            let _ = SetMenuItemInfoW(menu, id as u32, false, &mii);
+            // 必须用传进来的那一层: 子菜单是独立 HMENU, 拿顶层句柄设不进去
+            let _ = SetMenuItemInfoW(m, id as u32, false, &mii);
         };
-        // 顶部三行会变(供电、模式、原因、倒计时)
+        // 顶部四行会变(供电、模式、原因、倒计时)
         let [t_power, t_state, t_why] = menu_title_lines();
-        set_text(ID_TITLE, &t_power);
-        set_text(ID_TITLE_STATE, &t_state);
-        set_text(ID_TITLE_WHY, &t_why);
+        set_text(menu, ID_TITLE, &t_power);
+        set_text(menu, ID_TITLE_STATE, &t_state);
+        set_text(menu, ID_TITLE_WHY, &t_why);
+        set_text(
+            menu,
+            ID_TITLE_MODE,
+            &format!("{} · {}", mode_summary(mode), detect_summary(&cfg)),
+        );
+        // 「检查更新」自己就是进度条: 点下去之后这一行要立刻改成"正在检查更新..."
+        set_text(
+            menu,
+            ID_UPDATE_CHECK,
+            if crate::update::checking() {
+                "正在检查更新..."
+            } else {
+                "检查更新"
+            },
+        );
+        // 下载/检查的状态行只在真有内容时才动它, 否则会把这一行清成空白
+        if let Some(s) = crate::update::menu_status() {
+            set_text(menu, ID_UPDATE_NOTICE, &s);
+        }
         // 策略两项的标题里带着供电来源 —— 菜单开着期间插拔电源也要跟上,
         // 否则勾变了而标题还写着另一路, 是最容易误读的组合
         let (label_display, label_system) = policy_items(ac);
-        set_text(ID_POLICY_DISPLAY, &label_display);
-        set_text(ID_POLICY_SYSTEM, &label_system);
+        set_text(m_power, ID_POLICY_DISPLAY, &label_display);
+        set_text(m_power, ID_POLICY_SYSTEM, &label_system);
 
         // 菜单窗口句柄可能还没拿到(第一次点击前), 兜底再找一次
         let mut win = MENU_WINDOW.load(Ordering::SeqCst);
@@ -557,28 +730,46 @@ fn sync_menu_state() {
         if win == 0 {
             return;
         }
-        let hwnd = HWND(win);
+        // 要刷新的窗口可能有两个: 顶层菜单, 以及光标底下的那个子菜单窗口。
+        // 子菜单是独立窗口, 只刷顶层的话, 用户正看着的子菜单里的勾不会变。
+        let mut targets = [win, 0isize];
+        let point_win = MENU_POINT_WINDOW.load(Ordering::SeqCst);
+        if point_win != 0 && point_win != win {
+            targets[1] = point_win;
+        }
+        for t in targets {
+            if t == 0 {
+                continue;
+            }
+            if t != win && !IsWindow(HWND(t)).as_bool() {
+                // 钩子可能留下一个已经销毁的子菜单句柄
+                MENU_POINT_WINDOW.store(0, Ordering::SeqCst);
+                continue;
+            }
+            let hwnd = HWND(t);
 
-        // 只 RedrawWindow 的话, 高亮项(鼠标正悬停的那一条)不会重画自己的勾:
-        // 菜单绘制走的是"当前热点项单独一次 owner-draw", 不受整窗失效影响。
-        // 让菜单自己重新计算一次尺寸与热点项, 它就会把所有项(含高亮项)重绘。
-        let _ = SendMessageW(hwnd, WM_NCPAINT, WPARAM(1), LPARAM(0));
-        let _ = RedrawWindow(
-            hwnd,
-            None,
-            None,
-            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_FRAME,
-        );
+            // 只 RedrawWindow 的话, 高亮项(鼠标正悬停的那一条)不会重画自己的勾:
+            // 菜单绘制走的是"当前热点项单独一次 owner-draw", 不受整窗失效影响。
+            // 让菜单自己重新计算一次尺寸与热点项, 它就会把所有项(含高亮项)重绘。
+            let _ = SendMessageW(hwnd, WM_NCPAINT, WPARAM(1), LPARAM(0));
+            let _ = RedrawWindow(
+                hwnd,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_FRAME,
+            );
 
-        // 用一次"鼠标移到当前位置"的假动作强制菜单刷新热点项。
-        // 菜单窗口的 WM_MOUSEMOVE 处理会重绘旧热点项与新热点项 —— 即使坐标没变,
-        // 它也会走一遍完整的 item 重绘路径, 从而带上刚改过的勾选状态。
-        let mut cursor = POINT::default();
-        if GetCursorPos(&mut cursor).is_ok() {
-            let mut client = cursor;
-            if ScreenToClient(hwnd, &mut client).as_bool() {
-                let packed = ((client.y as u32 as isize) << 16) | (client.x as u32 as isize & 0xFFFF);
-                let _ = SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), LPARAM(packed));
+            // 用一次"鼠标移到当前位置"的假动作强制菜单刷新热点项。
+            // 菜单窗口的 WM_MOUSEMOVE 处理会重绘旧热点项与新热点项 —— 即使坐标没变,
+            // 它也会走一遍完整的 item 重绘路径, 从而带上刚改过的勾选状态。
+            let mut cursor = POINT::default();
+            if GetCursorPos(&mut cursor).is_ok() {
+                let mut client = cursor;
+                if ScreenToClient(hwnd, &mut client).as_bool() {
+                    let packed =
+                        ((client.y as u32 as isize) << 16) | (client.x as u32 as isize & 0xFFFF);
+                    let _ = SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), LPARAM(packed));
+                }
             }
         }
     }
@@ -613,7 +804,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     // 钩子给的 hwnd 是 owner(我们的消息窗口), 不是菜单窗口 —— 实测确认。
     // 菜单窗口只能靠 WindowFromPoint 或全局找 #32768 拿到。
     let mw = WindowFromPoint(pt);
-    if mw.0 != 0 {
+    if mw.0 != 0 && is_menu_window(mw) {
         MENU_WINDOW.store(mw.0, Ordering::SeqCst);
     } else if MENU_WINDOW.load(Ordering::SeqCst) == 0 {
         if let Some(w) = find_menu_window(menu) {
@@ -621,13 +812,28 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         }
     }
 
+    // 光标底下可能是子菜单。子菜单有自己的 HMENU, 命中测试必须在它自己那一层做:
+    // MenuItemFromPoint 只看传进去的那一个菜单。拿到就记下来, 刷新时要一起重绘。
+    let (hit_menu, hit_win) = menu_under_point(mw, menu);
+    if hit_win != 0 {
+        MENU_POINT_WINDOW.store(hit_win, Ordering::SeqCst);
+    }
+
     // < 0 表示没落在任何菜单项上(边框/菜单之外) -> 放行, 让菜单正常收起
-    let pos = MenuItemFromPoint(None, menu, pt);
+    let pos = MenuItemFromPoint(None, hit_menu, pt);
     if pos < 0 {
+        MENU_POINT_WINDOW.store(0, Ordering::SeqCst);
         return pass(());
     }
-    let id = GetMenuItemID(menu, pos) as usize;
-    // 分隔条返回 0; 顶部三行是 disabled, 两者都当"什么也不做"处理并吞掉
+    // 打开子菜单的父项: GetMenuItemID 返回 (UINT)-1, 必须放行 ——
+    // 否则这次点击会被吞掉, 子菜单永远打不开。
+    // windows-rs 里这个绑定返回 u32, 所以判 -1 要写 u32::MAX, 写 `< 0` 是恒假(编译器会警告)。
+    let raw = GetMenuItemID(hit_menu, pos);
+    if raw == u32::MAX {
+        return pass(());
+    }
+    let id = raw as usize;
+    // 分隔条返回 0; 顶部四行是 disabled, 两者都当"什么也不做"处理并吞掉
     if id != 0 && !keeps_menu_open(id) {
         return pass(()); // 需要关闭菜单的项走原生路径
     }
@@ -647,7 +853,142 @@ static MENU_OWNER: AtomicIsize = AtomicIsize::new(0);
 
 /// 用 TPM_RETURNCMD 取返回值。可连续操作的项由鼠标钩子就地处理(菜单不关闭),
 /// 只有需要交出焦点的项才会让 TrackPopupMenu 返回。
+/// 自绘菜单的宿主: 点击交回这里, 内容也从这里取。
+struct TrayHost {
+    owner: HWND,
+}
+
+impl crate::menu::Host for TrayHost {
+    fn activate(&mut self, id: usize) -> bool {
+        handle_command(self.owner, id);
+        refresh_icon(self.owner);
+        keeps_menu_open(id)
+    }
+
+    fn model(&self) -> crate::menu::Model {
+        modern_model()
+    }
+}
+
+/// 自绘菜单的内容。ID 全部沿用系统菜单那一套, 所以 `handle_command` 一行都不用改 ——
+/// 两套界面因此永远不会出现"某个开关只在一边生效"的分叉。
+pub(crate) fn modern_model() -> crate::menu::Model {
+    use crate::menu::{Item, Model, Row};
+
+    let cfg = Config::load_or_create();
+    let mode = current_mode();
+    let ac = current_ac();
+    let [t_power, t_state, t_why] = menu_title_lines();
+    let forced = matches!(mode, Mode::Force(_));
+    let force_pick = FORCE_PICK.load(Ordering::SeqCst);
+    let policy_is_display = if ac {
+        cfg.policy_ac.as_str()
+    } else {
+        cfg.policy_dc.as_str()
+    } == "display";
+
+    // 状态卡的三个圆点: 供电 / 模式 / 更新。
+    // 颜色只做冗余编码, 真正的信息在文字里 —— 色觉差异下也读得出来。
+    let dot_power = if ac { (61, 123, 255) } else { (160, 160, 160) };
+    let dot_mode = match mode {
+        Mode::Auto => (61, 123, 255),
+        Mode::Paused => (204, 51, 51),
+        Mode::Force(_) => (0, 224, 0),
+    };
+    let dot_update = if crate::update::has_update() {
+        (240, 68, 56)
+    } else {
+        (110, 110, 118)
+    };
+
+    let mut rows = vec![Row::Card {
+        dots: vec![dot_power, dot_mode, dot_update],
+        title: t_power,
+        subtitle: format!("{} · {}", t_state, t_why),
+        badge: crate::update::available().map(|r| format!("更新可用 v{}", r.version)),
+    }];
+
+    // 整份菜单里唯一"需要用户动手"的一行, 所以放在最上面而不是沉到底部
+    if let Some(s) = crate::update::menu_status() {
+        rows.push(Row::Item(Item::new(ID_UPDATE_NOTICE, s)));
+    }
+    rows.push(Row::Sep);
+
+    let mut mode_items = vec![
+        Item::new(ID_AUTO, "自动 (按活动检测)").checked(matches!(mode, Mode::Auto)),
+        Item::new(ID_PAUSE, "暂停 (允许正常休眠)").checked(matches!(mode, Mode::Paused)),
+    ];
+    for (id, label) in FORCE_ITEMS.iter() {
+        mode_items.push(Item::new(*id, *label).checked(forced && force_pick == *id));
+    }
+    rows.push(Row::Sub {
+        label: "模式".into(),
+        items: mode_items,
+    });
+
+    rows.push(Row::Sub {
+        label: "检测条件".into(),
+        items: vec![
+            Item::new(ID_DET_AUDIO, "音频播放").checked(cfg.audio_enabled),
+            Item::new(ID_DET_NET, "网络速率").checked(cfg.net_enabled),
+            Item::new(ID_DET_PROC, "进程 CPU").checked(cfg.proc_enabled),
+            Item::new(ID_DET_DL, "下载器").checked(cfg.dl_enabled),
+            Item::new(ID_DET_HINT, "外部提示文件").checked(cfg.hint_enabled),
+        ],
+    });
+
+    // 只呈现当前生效的那一路供电(与系统菜单一致), 另一路仍在配置里各自保存
+    let (label_display, label_system) = policy_items(ac);
+    rows.push(Row::Sub {
+        label: "电源与启动".into(),
+        items: vec![
+            Item::new(ID_POLICY_DISPLAY, label_display).checked(policy_is_display),
+            Item::new(ID_POLICY_SYSTEM, label_system).checked(!policy_is_display),
+            Item::new(ID_AUTOSTART, "开机自启").checked(autostart_installed()),
+        ],
+    });
+
+    rows.push(Row::Sep);
+    rows.push(Row::Item(Item::new(ID_DETAILS, "当前状态详情...")));
+    let check_label = if crate::update::checking() {
+        "正在检查更新..."
+    } else {
+        "检查更新"
+    };
+    rows.push(Row::Item(Item::new(ID_UPDATE_CHECK, check_label)));
+    rows.push(Row::Sub {
+        label: "更多".into(),
+        items: vec![
+            Item::new(ID_OPEN_LOG, "打开日志"),
+            Item::new(ID_OPEN_CFG, "打开配置文件"),
+            Item::new(ID_RELOAD, "重新加载配置"),
+            Item::new(ID_UPDATE_PAGE, "打开下载页"),
+        ],
+    });
+    rows.push(Row::Sep);
+    rows.push(Row::Item(Item::new(ID_EXIT, "退出").danger()));
+    // 底部小字标版本: 菜单里有「检查更新」, 那用户就得能看见自己现在是什么版本
+    rows.push(Row::Head(format!(
+        "stayawake v{}",
+        env!("CARGO_PKG_VERSION")
+    )));
+
+    Model::new(rows)
+}
+
 fn show_menu(hwnd: HWND) {
+    // 自绘菜单有自己的窗口和模态循环(也自带防重入), 不能和下面的 TrackPopupMenu 混用
+    if Config::load_or_create().menu_is_modern() {
+        if crate::menu::is_open() {
+            return;
+        }
+        // 建窗失败(注册类失败/句柄耗尽)会返回 false, 这一次就落到下面的系统菜单:
+        // 现代外观可以丢一次, 但右键点不出任何菜单是不能接受的。
+        if crate::menu::show(hwnd, TrayHost { owner: hwnd }) {
+            return;
+        }
+    }
+
     // TrackPopupMenu 内部跑自己的消息循环, 期间仍会派发消息 -> 防重入
     static OPEN: AtomicBool = AtomicBool::new(false);
     if OPEN.swap(true, Ordering::SeqCst) {
@@ -661,6 +1002,7 @@ fn show_menu(hwnd: HWND) {
         MENU_HANDLE.store(menu.0, Ordering::SeqCst);
         MENU_OWNER.store(hwnd.0, Ordering::SeqCst);
         MENU_WINDOW.store(0, Ordering::SeqCst);
+        MENU_POINT_WINDOW.store(0, Ordering::SeqCst);
 
         let hook = SetWindowsHookExW(WH_MOUSE, Some(mouse_hook), None, GetCurrentThreadId()).ok();
         MENU_HOOK.store(hook.map(|h| h.0).unwrap_or(0), Ordering::SeqCst);
@@ -683,6 +1025,12 @@ fn show_menu(hwnd: HWND) {
         MENU_HOOK.store(0, Ordering::SeqCst);
         MENU_HANDLE.store(0, Ordering::SeqCst);
         MENU_WINDOW.store(0, Ordering::SeqCst);
+        MENU_POINT_WINDOW.store(0, Ordering::SeqCst);
+        // DestroyMenu(顶层) 会连子菜单一起销毁, 但句柄必须先清掉:
+        // 下一次 sync_menu_state 若在 build_menu 之前被调用, 不能去改已死的菜单。
+        for s in MENU_SUB.iter() {
+            s.store(0, Ordering::SeqCst);
+        }
         let _ = DestroyMenu(menu);
         r.0 as usize
     };
@@ -696,7 +1044,7 @@ fn show_menu(hwnd: HWND) {
     OPEN.store(false, Ordering::SeqCst);
 }
 
-fn handle_command(hwnd: HWND, id: usize) {
+pub(crate) fn handle_command(hwnd: HWND, id: usize) {
     let cfg = Config::load_or_create();
     let force = |secs: u64| {
         FORCE_PICK.store(id, Ordering::SeqCst);
@@ -741,6 +1089,14 @@ fn handle_command(hwnd: HWND, id: usize) {
                 // 用真实状态校正乐观值(操作可能失败)
                 AUTOSTART_CACHE.store(crate::autostart::is_installed() as i8, Ordering::SeqCst);
             });
+        }
+        // 那一行同时是提示、进度条和按钮: 状态不同做的事不同, 判断放在 update 里。
+        ID_UPDATE_NOTICE => crate::update::menu_action(hwnd),
+        ID_UPDATE_CHECK => crate::update::check_now(),
+        ID_UPDATE_PAGE => {
+            if let Err(e) = crate::update::open_releases_page() {
+                log::event(&format!("update: 无法打开发布页: {e}"));
+            }
         }
         ID_OPEN_LOG => log::open_in_editor(&config::log_path()),
         ID_OPEN_CFG => log::open_in_editor(&config::config_path()),
@@ -848,6 +1204,14 @@ fn show_details(hwnd: HWND) {
         on(cfg.hint_enabled)
     ));
     lines.push(String::new());
+    // 更新那几行放在最后一段: 它是这块诊断里唯一"可能要你动手"的信息,
+    // 混在检测状态里会让人以为程序出故障了。
+    let upd = crate::update::detail_lines();
+    if !upd.is_empty() {
+        lines.push("更新".to_string());
+        lines.extend(upd);
+    }
+    lines.push(String::new());
     lines.push("完整读数请运行:  stayawake.exe --status".to_string());
 
     let mut text: Vec<u16> = lines.join("\r\n").encode_utf16().collect();
@@ -894,6 +1258,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
 
         WM_STATE_CHANGED => {
             refresh_icon(hwnd);
+            // 菜单正开着时也要跟着变: 点了「检查更新」以后那行字要立刻从
+            // 「正在检查更新...」变成「发现新版本 x.y.z」。
+            // sync_menu_state 只在菜单真的存在时才做事(MENU_HANDLE == 0 直接返回)。
+            sync_menu_state();
+            // 自绘菜单同理: 它开着时把自己的内容重取一遍
+            crate::menu::refresh();
             LRESULT(0)
         }
 

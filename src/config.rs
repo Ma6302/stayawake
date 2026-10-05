@@ -95,6 +95,26 @@ dl_tcp_conns = 4
 # 删除即释放; 文件 mtime 超过 hint_ttl_secs 自动失效(写方崩溃不会把机器永久卡醒)
 hint_enabled = true
 hint_ttl_secs = 60
+
+
+# ── 托盘菜单外观 ──
+# modern = 自绘现代菜单(默认): 圆角面板、跟随系统的深浅色、状态卡片 + 手风琴二级菜单
+# system = 系统原生菜单(永远可用)。自绘在远程桌面、Win10 早期版本、多屏混合缩放下
+#          可能不理想 —— 出问题改回 system 即可, 这条兜底路径会一直保留。
+# 另外: 自绘菜单若建窗失败, 那一次会**自动**回落到系统菜单, 不会点不出东西。
+menu_style = modern
+# 自绘菜单配色: auto 跟随系统应用主题 / light 强制浅色 / dark 强制深色
+menu_theme = auto
+
+
+# ── 在线更新 ──
+# 打开时后台定时查询 GitHub Releases, 有新版本就在菜单顶部和托盘图标上提示。
+# 只查不装: 点「下载安装包」会下载到临时目录, 再问你要不要运行 —— 从不静默替换自己。
+update_enabled = true
+# 查询间隔(小时)。0 = 只在启动时查一次
+update_interval_hours = 24
+# stable = 只跟正式版 / beta = 连预发布版一起跟
+update_channel = stable
 "#;
 
 #[derive(Clone, Default)]
@@ -127,6 +147,17 @@ pub struct Config {
 
     pub hint_enabled: bool,
     pub hint_ttl_secs: u64,
+
+    /// "system" | "modern"。空串(Config::default())按 system 处理 —— 自绘必须可退出。
+    pub menu_style: String,
+    /// "auto" | "light" | "dark"
+    pub menu_theme: String,
+
+    pub update_enabled: bool,
+    /// 0 = 只在启动时查一次
+    pub update_interval_hours: u64,
+    /// "stable" | "beta"
+    pub update_channel: String,
 
     /// 原始行, 回写时保留注释与未知键
     raw: Vec<String>,
@@ -239,18 +270,24 @@ impl Reader {
         parsed
     }
 
-    fn policy(&mut self, key: &str, d: &str) -> String {
+    /// 白名单枚举取值。只接受白名单内的小写形式, 其余告警并回落默认值 ——
+    /// 静默回落会让用户以为自己写的值生效了(例如 `menu_style = Modern` 拼错大小写)。
+    fn choice(&mut self, key: &str, d: &str, allowed: &[&str]) -> String {
         let v = self.raw(key);
         if v.is_empty() {
             return d.to_string();
         }
         let lower = v.to_ascii_lowercase();
-        if lower == "system" || lower == "display" {
+        if allowed.contains(&lower.as_str()) {
             return lower;
         }
         let (v, d) = (v.to_string(), d.to_string());
         self.invalid(key, &v, &d);
         d
+    }
+
+    fn policy(&mut self, key: &str, d: &str) -> String {
+        self.choice(key, d, &["system", "display"])
     }
 
     fn list(&self, key: &str) -> Vec<String> {
@@ -445,6 +482,13 @@ impl Config {
             hint_enabled: r.bool("hint_enabled", true),
             hint_ttl_secs: r.u64("hint_ttl_secs", 60, 10, u64::MAX),
 
+            menu_style: r.choice("menu_style", "modern", &["system", "modern"]),
+            menu_theme: r.choice("menu_theme", "auto", &["auto", "light", "dark"]),
+
+            update_enabled: r.bool("update_enabled", true),
+            update_interval_hours: r.u64("update_interval_hours", 24, 0, 24 * 30),
+            update_channel: r.choice("update_channel", "stable", &["stable", "beta"]),
+
             raw,
             warnings: r.warnings,
         }
@@ -453,6 +497,15 @@ impl Config {
     /// 解析期间发现的非法值/夹取。由 worker 加载后记一次日志, `--status` 也会打印。
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// 是否用自绘菜单。出厂默认就是 `modern`(它才是这次改动的目的), `system` 是兜底开关。
+    /// 唯二回到系统菜单的情况: 用户显式写了 `system`, 或者值是空串(`Config::default()`,
+    /// 只出现在单测和极端构造路径上)。`show_menu` 还会在自绘建窗失败时再兜一层。
+    pub fn menu_is_modern(&self) -> bool {
+        // 空串只可能来自 `Config::default()`, 那种对象没有"用户选择"可言:
+        // 回落到系统菜单最安全(自绘那条路要建窗, 失败会连菜单都没有)。
+        !self.menu_style.is_empty() && self.menu_style != "system"
     }
 
     /// 就地替换某键的值, 返回完整的新文件内容。**不落盘**, 便于单测。
@@ -703,6 +756,71 @@ mod tests {
         let cfg = Config::from_text("fast_poll_secs = 0\n");
         assert_eq!(cfg.fast_poll_secs, 0);
         assert!(cfg.warnings().is_empty(), "得到 {:?}", cfg.warnings());
+    }
+
+    // ───────────────── 菜单外观 / 在线更新 ─────────────────
+
+    /// 枚举型取值白名单: 大小写不敏感, 但不该因为大小写不同就报错
+    #[test]
+    fn enum_values_are_whitelisted_and_lowercased() {
+        let cfg = Config::from_text("menu_style = MODERN\nmenu_theme = Dark\nupdate_channel = Beta\n");
+        assert_eq!(cfg.menu_style, "modern");
+        assert_eq!(cfg.menu_theme, "dark");
+        assert_eq!(cfg.update_channel, "beta");
+        assert!(cfg.warnings().is_empty(), "大小写不同不算错: {:?}", cfg.warnings());
+    }
+
+    /// 非法枚举值必须告警并回落(回落到出厂默认值, 而不是静默生效)。
+    /// 静默回落的话, 用户写 `menu_style = Modern` 会以为自己的拼写被接受了。
+    #[test]
+    fn bogus_enum_falls_back_and_warns() {
+        let cfg =
+            Config::from_text("menu_style = fancy\nmenu_theme = 深色\nupdate_channel = nightly\n");
+        assert_eq!(cfg.menu_style, "modern", "非法值必须回到出厂默认值");
+        assert_eq!(cfg.menu_theme, "auto");
+        assert_eq!(cfg.update_channel, "stable");
+        let w = cfg.warnings().join("\n");
+        for k in ["menu_style", "menu_theme", "update_channel"] {
+            assert!(w.contains(k), "{} 非法却未告警: {}", k, w);
+        }
+    }
+
+    /// 自绘菜单必须能被关掉: 显式 `system` 与空串都走系统菜单。
+    #[test]
+    fn only_explicit_modern_enables_the_self_drawn_menu() {
+        assert!(!Config::from_text("menu_style = system\n").menu_is_modern());
+        assert!(Config::from_text("menu_style = modern\n").menu_is_modern());
+        assert!(!Config::default().menu_is_modern(), "空串必须回到系统菜单");
+        // 出厂默认必须是自绘的: 用户的诉求就是"看起来现代", 默认走系统菜单等于没改
+        assert!(
+            Config::from_text(DEFAULT_CONFIG).menu_is_modern(),
+            "出厂默认值必须是 modern"
+        );
+    }
+
+    /// `update_interval_hours = 0` 是文档化的"只在启动时查一次", 不是错误
+    #[test]
+    fn update_interval_zero_is_not_a_warning() {
+        let cfg = Config::from_text("update_interval_hours = 0\n");
+        assert_eq!(cfg.update_interval_hours, 0);
+        assert!(cfg.warnings().is_empty(), "得到 {:?}", cfg.warnings());
+    }
+
+    /// 新键必须能被 migrate 追加上, 否则老用户永远看不到这些开关
+    #[test]
+    fn migration_appends_the_new_keys() {
+        let migrated = migrate_text("poll_interval_secs = 15\naudio_enabled = true\n");
+        for k in [
+            "menu_style",
+            "menu_theme",
+            "update_enabled",
+            "update_interval_hours",
+            "update_channel",
+        ] {
+            assert!(migrated.contains(k), "{} 未被追加:\n{}", k, migrated);
+        }
+        assert!(migrated.starts_with("poll_interval_secs = 15"), "老内容不该被动");
+        assert_eq!(migrate_text(&migrated), migrated, "迁移必须幂等");
     }
 
     /// NaN 必须挡掉: `pct >= NaN` 恒假, 检测器会静默永不命中 ——

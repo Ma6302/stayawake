@@ -1,4 +1,4 @@
-﻿; stayawake 安装脚本 (Inno Setup 6)
+; stayawake 安装脚本 (Inno Setup 6)
 ;
 ; 编译:  ISCC.exe installer\stayawake.iss
 ; 产物:  dist\stayawake-<版本>-setup.exe
@@ -12,7 +12,7 @@
 
 #define AppName "stayawake"
 ; 必须与 Cargo.toml 的 version 一致。改版本号时两处一起改。
-#define AppVersion "0.1.2"
+#define AppVersion "0.1.3"
 #define AppPublisher "Ma6302"
 #define AppURL "https://github.com/Ma6302/stayawake"
 #define ExeName "stayawake.exe"

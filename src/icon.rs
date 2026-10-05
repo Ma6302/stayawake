@@ -71,6 +71,36 @@ pub fn paint(look: Look, size: usize) -> Vec<u32> {
     px
 }
 
+/// 有可用更新时角标的底色。挑红色而不是蓝色: 蓝色已经是"保持屏幕/强制"的语义
+/// (`Look::SystemDisplay`/`Force`), 同一个图标上再放一块蓝, 谁是谁就说不清了。
+const BADGE: Rgb = (240, 68, 56);
+
+/// `paint` 加一个"有新版本"的角标: 右上角一枚红点, 里面一个向下的箭头。
+///
+/// 单独一个函数而不是给 `paint` 加参数: `paint` 的签名被 build.rs 和 --write-ico
+/// 共用, 产品图标和安装包图标不该长角标。
+///
+/// 先画白盘再画红盘, 于是红点自带一圈白边 —— 角标压在灰色主体上、甚至压在
+/// `Force` 的绿点上时都还分得出来。16px 托盘尺寸下箭头会糊成一个点, 这正是
+/// 想要的效果: 缩到多小都还是"有个新东西"的信号。
+pub fn paint_with_badge(look: Look, size: usize, badge: bool) -> Vec<u32> {
+    let mut px = paint(look, size);
+    if !badge {
+        return px;
+    }
+    let k = size as f32 / 32.0;
+    let at = (24.0 * k, 9.0 * k);
+    const WHITE: Rgb = (255, 255, 255);
+    fill_disc(&mut px, size, at, 6.0 * k, WHITE);
+    fill_disc(&mut px, size, at, 5.0 * k, BADGE);
+    // 向下箭头: 一竖 + 一个 V 的两笔
+    let w = 1.7 * k;
+    stroke_line(&mut px, size, (24.0 * k, 5.6 * k), (24.0 * k, 9.6 * k), w, WHITE);
+    stroke_line(&mut px, size, (21.4 * k, 7.4 * k), (24.0 * k, 10.4 * k), w, WHITE);
+    stroke_line(&mut px, size, (26.6 * k, 7.4 * k), (24.0 * k, 10.4 * k), w, WHITE);
+    px
+}
+
 fn fill_disc(px: &mut [u32], size: usize, (cx, cy): (f32, f32), radius: f32, color: Rgb) {
     let rr = radius * radius;
     composite(px, size, color, |x, y| {
@@ -78,7 +108,6 @@ fn fill_disc(px: &mut [u32], size: usize, (cx, cy): (f32, f32), radius: f32, col
         dx * dx + dy * dy <= rr
     });
 }
-
 /// 圆头线段: 判据是"到线段的距离 ≤ 半宽"
 fn stroke_line(px: &mut [u32], size: usize, a: (f32, f32), b: (f32, f32), width: f32, color: Rgb) {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);

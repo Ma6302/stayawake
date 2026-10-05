@@ -3,3 +3,18 @@
 # 不入库。图标从代码生成(见 README 的"打安装包"), 提交它只会带来跟代码脱节的风险。
 /dist
 /installer/stayawake.ico
+# 装到 Program Files 时临时放在仓库根的待安装 exe 和它的日志(见 install-new.ps1)。
+# 它们是"这一台机器上刚编出来的那份", 跟源码不同步, 入库只会让人以为它才是发布物。
+/stayawake.exe
+/install-log.txt
+# 本机构建/安装留下的临时产物: cargo 缓存、测试用 TMP、一次性提权安装器与日志、
+# 旧版 exe 备份、ACL 恢复残留。换台机器重建即可, 不该进版本库。
+/_cargo_target/
+/_test_tmp/
+/_test_build.log
+/_install_run.ps1
+/_install_run_log.txt
+/.acl-recovery/
+/err.txt
+/out.txt
+/stayawake_prefix_backup.exe

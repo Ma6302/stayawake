@@ -6,8 +6,10 @@ mod detect;
 mod engine;
 mod icon;
 mod log;
+mod menu;
 mod power;
 mod tray;
+mod update;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -53,6 +55,15 @@ impl Shared {
 }
 
 fn main() {
+    // 必须赶在创建任何窗口之前: 进程不感知 DPI 时 GetDpiForWindow 会被虚拟化恒返 96,
+    // 自绘菜单就没法按显示器缩放, 在高 DPI 上会被系统拉伸成糊的。
+    // 失败(老系统)就算了, 系统菜单和托盘图标不依赖它。
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
+    }
+
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--status") => print_status(),
@@ -109,6 +120,7 @@ fn write_ico(path: &std::path::Path) -> std::io::Result<u64> {
 
 fn run_daemon() {
     if !claim_single_instance() {
+        eprintln!("claim_single_instance failed, another instance running?");
         return;
     }
     let (eco, prio) = lower_footprint();
@@ -136,6 +148,10 @@ fn run_daemon() {
             .expect("spawn worker");
     }
 
+    // 更新检查是独立线程, 且**先于**托盘启动: 它只写状态, 第一个结果会触发
+    // WM_STATE_CHANGED 之外的一次刷新, 与托盘就绪与否无关。
+    update::spawn();
+
     // 主线程跑消息循环(托盘图标必须在有消息泵的线程上)
     tray::run(shared, hwnd_tx);
     log::event("=== stayawake stopped ===");
@@ -145,9 +161,10 @@ fn run_daemon() {
 /// 句柄故意不关闭: 互斥体需活到进程结束, 由系统回收。
 fn claim_single_instance() -> bool {
     unsafe {
-        let Ok(_mutex) = CreateMutexW(None, true, w!("Local\\stayawake_single_instance")) else {
+        let mutex = CreateMutexW(None, true, w!("Local\\stayawake_single_instance"));
+        if mutex.is_err() {
             return false;
-        };
+        }
         windows::Win32::Foundation::GetLastError() != Err(ERROR_ALREADY_EXISTS.into())
     }
 }
@@ -185,6 +202,11 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
     // 阈值会在用户连点菜单时反复刷日志(1MB 只留一代, 历史会被冲掉)。
     let mut logged_warnings: Vec<String> = Vec::new();
     log_config_warnings(&cfg, &mut logged_warnings);
+    update::configure(
+        cfg.update_enabled,
+        cfg.update_interval_hours,
+        &cfg.update_channel,
+    );
     let mut engine = Engine::new();
     let mut hwnd: Option<HWND> = None;
     // 上次完整检测的时刻。None = 还没做过, 立刻做一次。
@@ -211,6 +233,12 @@ fn worker(shared: Arc<Shared>, hwnd_rx: mpsc::Receiver<HWND>) {
             last_full = None; // 配置变了, 立刻重做完整检测
             log::event("config reloaded");
             log_config_warnings(&cfg, &mut logged_warnings);
+            // 用户可能刚改完 update_* 或 menu_style: 让更新线程按新设置立刻重判
+            update::configure(
+                cfg.update_enabled,
+                cfg.update_interval_hours,
+                &cfg.update_channel,
+            );
         }
         if hwnd.is_none() {
             hwnd = hwnd_rx.try_recv().ok();
